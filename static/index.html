@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Качалка — скачиватель видео</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --bg-card: #1a1d27;
+      --bg-input: #12151e;
+      --border: #2a2f3d;
+      --text: #e8eaef;
+      --muted: #8b93a7;
+      --accent: #6c8cff;
+      --accent-hover: #8aa4ff;
+      --accent-dim: rgba(108, 140, 255, 0.15);
+      --ok: #3dd68c;
+      --err: #ff6b7a;
+      --warn: #f0c14b;
+      --shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background:
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(108, 140, 255, 0.18), transparent),
+        radial-gradient(ellipse 60% 40% at 100% 100%, rgba(61, 214, 140, 0.06), transparent),
+        var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 48px 20px 64px;
+    }
+
+    .wrap {
+      width: 100%;
+      max-width: 560px;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 56px;
+      height: 56px;
+      border-radius: 14px;
+      background: rgba(61, 214, 140, 0.12);
+      border: 1px solid rgba(61, 214, 140, 0.35);
+      margin-bottom: 14px;
+    }
+
+    .logo svg {
+      width: 34px;
+      height: 34px;
+      display: block;
+    }
+
+    h1 {
+      font-size: 1.65rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      margin-top: 6px;
+      font-size: 0.95rem;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 28px 24px;
+    }
+
+    .field {
+      margin-bottom: 16px;
+    }
+
+    .field:last-child { margin-bottom: 0; }
+
+    .field-label {
+      display: block;
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+    }
+
+    input[type="url"],
+    input[type="text"],
+    select {
+      flex: 1;
+      min-width: 0;
+      width: 100%;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 14px 16px;
+      font-size: 1rem;
+      outline: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+      font-family: inherit;
+    }
+
+    select {
+      cursor: pointer;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%238b93a7' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 14px center;
+      padding-right: 36px;
+    }
+
+    select:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    select option {
+      background: var(--bg-card);
+      color: var(--text);
+    }
+
+    input:focus,
+    select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-dim);
+    }
+
+    input::placeholder { color: #5a6275; }
+
+    #folder {
+      font-size: 0.9rem;
+      font-family: Consolas, "Cascadia Mono", monospace;
+    }
+
+    button {
+      font-family: inherit;
+      font-size: 0.95rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      padding: 14px 20px;
+      transition: background 0.15s, transform 0.1s, opacity 0.15s;
+    }
+
+    button:active { transform: scale(0.98); }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      white-space: nowrap;
+    }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+
+    .btn-secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .btn-secondary:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.04);
+      border-color: #3d4458;
+    }
+
+    .btn-ghost {
+      background: var(--accent-dim);
+      color: var(--accent);
+      border: 1px solid rgba(108, 140, 255, 0.3);
+    }
+    .btn-ghost:hover:not(:disabled) {
+      background: rgba(108, 140, 255, 0.25);
+    }
+
+    .btn-block {
+      width: 100%;
+      margin-top: 4px;
+    }
+
+    /* Переключатель Видео / Звук */
+    .mode-toggle {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      padding: 4px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+
+    .mode-toggle button {
+      padding: 12px 10px;
+      border-radius: 10px;
+      background: transparent;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.92rem;
+      border: 1px solid transparent;
+    }
+
+    .mode-toggle button:hover:not(:disabled) {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .mode-toggle button.active {
+      background: var(--accent-dim);
+      color: var(--text);
+      border-color: rgba(108, 140, 255, 0.35);
+      box-shadow: 0 0 0 1px rgba(108, 140, 255, 0.12);
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    /* Progress */
+    .progress-block { margin-top: 8px; }
+
+    .progress-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 10px;
+      font-size: 0.9rem;
+    }
+
+    .progress-meta .pct {
+      font-weight: 700;
+      font-size: 1.25rem;
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .progress-meta .detail {
+      color: var(--muted);
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .bar {
+      height: 10px;
+      background: var(--bg-input);
+      border-radius: 999px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+
+    .bar > i {
+      display: block;
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #4d6fff, #8aa4ff);
+      border-radius: 999px;
+      transition: width 0.35s ease;
+    }
+
+    .status-line {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 0.9rem;
+      word-break: break-word;
+    }
+
+    .title-done {
+      font-size: 1.1rem;
+      font-weight: 600;
+      line-height: 1.35;
+      margin-bottom: 4px;
+      word-break: break-word;
+    }
+
+    .file-done {
+      color: var(--muted);
+      font-size: 0.85rem;
+      margin-bottom: 4px;
+      word-break: break-all;
+    }
+
+    .badge-ok {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--ok);
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+
+    .error-box {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: rgba(255, 107, 122, 0.1);
+      border: 1px solid rgba(255, 107, 122, 0.35);
+      color: var(--err);
+      font-size: 0.92rem;
+      line-height: 1.4;
+    }
+
+    .warn-box {
+      margin-top: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(240, 193, 75, 0.1);
+      border: 1px solid rgba(240, 193, 75, 0.35);
+      color: var(--warn);
+      font-size: 0.88rem;
+      line-height: 1.4;
+    }
+
+    /* History */
+    .history {
+      margin-top: 28px;
+    }
+
+    .history h2 {
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 12px;
+      font-weight: 600;
+    }
+
+    .history-list {
+      list-style: none;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .history-list li {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.9rem;
+    }
+
+    .history-list li:last-child { border-bottom: none; }
+
+    .history-list .name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+
+    .history-list .size {
+      color: var(--muted);
+      flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+      font-size: 0.85rem;
+    }
+
+    .history-empty {
+      color: var(--muted);
+      font-size: 0.9rem;
+      padding: 16px;
+      text-align: center;
+    }
+
+    .hidden { display: none !important; }
+
+    footer {
+      margin-top: 36px;
+      text-align: center;
+      color: #4a5163;
+      font-size: 0.8rem;
+      word-break: break-all;
+      padding: 0 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <!-- контур облака -->
+          <path
+            d="M18 36c-4.4 0-8-3.1-8-7s3.6-7 8-7c.6-5.5 5.3-9.8 11-9.8 5.2 0 9.5 3.5 10.7 8.2.7-.2 1.5-.3 2.3-.3 4.4 0 8 3.1 8 7s-3.6 7-8 7H18z"
+            stroke="#e6ebf5"
+            stroke-width="3.2"
+            stroke-linejoin="round"
+          />
+          <!-- зелёная стрелка вниз -->
+          <path d="M32 28v14" stroke="#2dc878" stroke-width="5" stroke-linecap="round"/>
+          <path d="M20 40 L32 54 L44 40 Z" fill="#2dc878"/>
+        </svg>
+      </div>
+      <h1>Качалка</h1>
+      <p class="subtitle">Вставь ссылку — сохрани видео или только звук</p>
+    </header>
+
+    <div class="card">
+      <!-- Форма ввода -->
+      <div id="panel-form">
+        <div class="field">
+          <label class="field-label" for="url">Ссылка на видео</label>
+          <input
+            id="url"
+            type="url"
+            placeholder="Вставь ссылку на видео"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </div>
+
+        <div class="field">
+          <span class="field-label">Что скачать</span>
+          <div class="mode-toggle" role="group" aria-label="Режим скачивания">
+            <button type="button" class="active" id="mode-video" data-mode="video">
+              🎬 Видео
+            </button>
+            <button type="button" id="mode-audio" data-mode="audio">
+              🎵 Только звук (mp3)
+            </button>
+          </div>
+        </div>
+
+        <div class="field" id="field-quality">
+          <label class="field-label" for="quality">Качество видео</label>
+          <select id="quality" aria-label="Качество видео">
+            <option value="best" selected>Лучшее</option>
+            <option value="720">До 720p (меньше весит)</option>
+            <option value="480">До 480p (совсем лёгкое)</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="folder">Куда сохранять</label>
+          <div class="row">
+            <input
+              id="folder"
+              type="text"
+              placeholder="Папка на диске"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button type="button" class="btn-secondary" id="btn-browse" title="Выбрать папку">
+              Обзор…
+            </button>
+          </div>
+        </div>
+
+        <button type="button" class="btn-primary btn-block" id="btn-download">Скачать</button>
+        <div id="form-error" class="error-box hidden"></div>
+        <div id="form-warn" class="warn-box hidden"></div>
+      </div>
+
+      <!-- Прогресс -->
+      <div id="panel-progress" class="progress-block hidden">
+        <div class="progress-meta">
+          <span class="pct" id="pct">0%</span>
+          <span class="detail" id="detail"></span>
+        </div>
+        <div class="bar"><i id="bar-fill"></i></div>
+        <p class="status-line" id="status-line">Скачиваю…</p>
+        <div id="progress-warn" class="warn-box hidden"></div>
+      </div>
+
+      <!-- Готово -->
+      <div id="panel-done" class="hidden">
+        <div class="badge-ok">✓ Готово</div>
+        <div class="title-done" id="done-title"></div>
+        <div class="file-done" id="done-file"></div>
+        <div class="file-done" id="done-folder"></div>
+        <div id="done-warn" class="warn-box hidden"></div>
+        <div class="actions">
+          <button type="button" class="btn-ghost" id="btn-folder">Открыть папку</button>
+          <button type="button" class="btn-secondary" id="btn-again">Скачать ещё</button>
+        </div>
+      </div>
+
+      <!-- Ошибка во время скачивания -->
+      <div id="panel-error" class="hidden">
+        <div id="dl-error" class="error-box"></div>
+        <div class="actions">
+          <button type="button" class="btn-secondary" id="btn-retry">Попробовать снова</button>
+        </div>
+      </div>
+    </div>
+
+    <section class="history">
+      <h2>Последние в этой папке</h2>
+      <ul class="history-list" id="history-list">
+        <li class="history-empty">Пока пусто — скачай первое видео</li>
+      </ul>
+    </section>
+
+    <footer id="footer">Качалка · локально на этом ПК</footer>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const FOLDER_KEY = "kachalka_folder";
+    const MODE_KEY = "kachalka_mode";
+    const QUALITY_KEY = "kachalka_quality";
+
+    const panelForm = $("panel-form");
+    const panelProgress = $("panel-progress");
+    const panelDone = $("panel-done");
+    const panelError = $("panel-error");
+    const formError = $("form-error");
+    const formWarn = $("form-warn");
+    const progressWarn = $("progress-warn");
+    const doneWarn = $("done-warn");
+    const urlInput = $("url");
+    const folderInput = $("folder");
+    const qualitySelect = $("quality");
+    const fieldQuality = $("field-quality");
+    const btnDownload = $("btn-download");
+    const btnBrowse = $("btn-browse");
+    const modeVideo = $("mode-video");
+    const modeAudio = $("mode-audio");
+    const pctEl = $("pct");
+    const detailEl = $("detail");
+    const barFill = $("bar-fill");
+    const statusLine = $("status-line");
+    const doneTitle = $("done-title");
+    const doneFile = $("done-file");
+    const doneFolder = $("done-folder");
+    const dlError = $("dl-error");
+    const historyList = $("history-list");
+    const footer = $("footer");
+
+    let pollTimer = null;
+    let defaultFolder = "";
+    let lastOutDir = "";
+    let currentMode = "video";
+
+    function currentQuality() {
+      const q = (qualitySelect.value || "best").toLowerCase();
+      if (q === "720" || q === "480") return q;
+      return "best";
+    }
+
+    function setMode(mode) {
+      currentMode = mode === "audio" ? "audio" : "video";
+      modeVideo.classList.toggle("active", currentMode === "video");
+      modeAudio.classList.toggle("active", currentMode === "audio");
+      const videoMode = currentMode === "video";
+      fieldQuality.style.opacity = videoMode ? "1" : "0.55";
+      qualitySelect.disabled = !videoMode;
+      try {
+        localStorage.setItem(MODE_KEY, currentMode);
+      } catch (_) {}
+    }
+
+    function showOnly(panel) {
+      panelForm.classList.toggle("hidden", panel !== "form");
+      panelProgress.classList.toggle("hidden", panel !== "progress");
+      panelDone.classList.toggle("hidden", panel !== "done");
+      panelError.classList.toggle("hidden", panel !== "error");
+      formError.classList.add("hidden");
+    }
+
+    function stopPoll() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    function currentFolder() {
+      return folderInput.value.trim();
+    }
+
+    function saveFolderLocal(path) {
+      if (path) {
+        try {
+          localStorage.setItem(FOLDER_KEY, path);
+        } catch (_) {}
+      }
+    }
+
+    function setWarn(el, text) {
+      if (text) {
+        el.textContent = text;
+        el.classList.remove("hidden");
+      } else {
+        el.textContent = "";
+        el.classList.add("hidden");
+      }
+    }
+
+    function updateFooter(path) {
+      const p = path || currentFolder() || "Скачанное";
+      footer.textContent = "Качалка · " + p;
+    }
+
+    async function loadHistory() {
+      try {
+        const folder = currentFolder();
+        const q = folder ? "?folder=" + encodeURIComponent(folder) : "";
+        const res = await fetch("/api/history" + q);
+        const data = await res.json();
+        const files = data.files || [];
+        if (!files.length) {
+          historyList.innerHTML =
+            '<li class="history-empty">Пока пусто — скачай первое видео</li>';
+          return;
+        }
+        historyList.innerHTML = files
+          .map(
+            (f) =>
+              `<li><span class="name" title="${escapeAttr(f.name)}">${escapeHtml(
+                f.name
+              )}</span><span class="size">${escapeHtml(f.size)}</span></li>`
+          )
+          .join("");
+      } catch (_) {
+        /* ignore */
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function escapeAttr(s) {
+      return escapeHtml(s).replace(/'/g, "&#39;");
+    }
+
+    function applyStatus(s) {
+      if (s.out_dir) {
+        lastOutDir = s.out_dir;
+      }
+      if (s.status === "downloading") {
+        showOnly("progress");
+        const p = Number(s.percent) || 0;
+        pctEl.textContent = p.toFixed(p % 1 ? 1 : 0) + "%";
+        barFill.style.width = Math.min(100, p) + "%";
+        const parts = [];
+        if (s.size) parts.push(s.size);
+        if (s.speed) parts.push(s.speed);
+        detailEl.textContent = parts.join(" · ");
+        let modeHint = "";
+        if (s.mode === "audio") modeHint = " (mp3)";
+        else if (s.quality === "720") modeHint = " (до 720p)";
+        else if (s.quality === "480") modeHint = " (до 480p)";
+        statusLine.textContent = s.title
+          ? "Скачиваю" + modeHint + ": " + s.title
+          : "Скачиваю" + modeHint + "…";
+        setWarn(progressWarn, s.warning || "");
+        if (s.out_dir) updateFooter(s.out_dir);
+      } else if (s.status === "done") {
+        stopPoll();
+        showOnly("done");
+        doneTitle.textContent =
+          s.title || (s.mode === "audio" ? "Аудио" : "Видео");
+        doneFile.textContent = s.filename
+          ? s.filename + (s.size ? " · " + s.size : "")
+          : s.size || "";
+        doneFolder.textContent = s.out_dir ? "Папка: " + s.out_dir : "";
+        setWarn(doneWarn, s.warning || "");
+        if (s.out_dir) {
+          folderInput.value = s.out_dir;
+          saveFolderLocal(s.out_dir);
+          updateFooter(s.out_dir);
+        }
+        loadHistory();
+      } else if (s.status === "error") {
+        stopPoll();
+        showOnly("error");
+        dlError.textContent = s.error || "Не получилось скачать";
+      } else if (s.status === "idle") {
+        stopPoll();
+        showOnly("form");
+      }
+    }
+
+    async function pollStatus() {
+      try {
+        const res = await fetch("/api/status");
+        const s = await res.json();
+        applyStatus(s);
+      } catch (_) {
+        /* сервер мог быть занят — попробуем в следующий тик */
+      }
+    }
+
+    function startPoll() {
+      stopPoll();
+      pollStatus();
+      pollTimer = setInterval(pollStatus, 1000);
+    }
+
+    async function startDownload() {
+      const url = urlInput.value.trim();
+      formError.classList.add("hidden");
+      setWarn(formWarn, "");
+
+      if (!url) {
+        formError.textContent = "Вставь ссылку на видео";
+        formError.classList.remove("hidden");
+        urlInput.focus();
+        return;
+      }
+
+      const folder = currentFolder();
+      btnDownload.disabled = true;
+      btnBrowse.disabled = true;
+      modeVideo.disabled = true;
+      modeAudio.disabled = true;
+      qualitySelect.disabled = true;
+      try {
+        const res = await fetch("/api/download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url,
+            folder: folder || null,
+            mode: currentMode,
+            quality: currentMode === "video" ? currentQuality() : "best",
+          }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          formError.textContent = data.error || "Не удалось начать скачивание";
+          formError.classList.remove("hidden");
+          return;
+        }
+        if (data.out_dir) {
+          folderInput.value = data.out_dir;
+          lastOutDir = data.out_dir;
+          saveFolderLocal(data.out_dir);
+          updateFooter(data.out_dir);
+        }
+        setWarn(progressWarn, data.warning || "");
+        showOnly("progress");
+        pctEl.textContent = "0%";
+        barFill.style.width = "0%";
+        detailEl.textContent = "";
+        let startHint = "Скачиваю…";
+        if (currentMode === "audio") startHint = "Скачиваю (mp3)…";
+        else if (currentQuality() === "720") startHint = "Скачиваю (до 720p)…";
+        else if (currentQuality() === "480") startHint = "Скачиваю (до 480p)…";
+        statusLine.textContent = startHint;
+        startPoll();
+      } catch (_) {
+        formError.textContent = "Нет связи с сервером — перезапусти start.bat";
+        formError.classList.remove("hidden");
+      } finally {
+        btnDownload.disabled = false;
+        btnBrowse.disabled = false;
+        modeVideo.disabled = false;
+        modeAudio.disabled = false;
+        qualitySelect.disabled = currentMode !== "video";
+      }
+    }
+
+    async function browseFolder() {
+      formError.classList.add("hidden");
+      setWarn(formWarn, "Открой окно выбора папки (может быть за другими окнами)…");
+      btnBrowse.disabled = true;
+      btnBrowse.textContent = "Жди…";
+      try {
+        const res = await fetch("/api/browse-folder", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ folder: currentFolder() || null }),
+        });
+        const data = await res.json();
+        setWarn(formWarn, "");
+        if (data.ok && data.folder) {
+          folderInput.value = data.folder;
+          saveFolderLocal(data.folder);
+          updateFooter(data.folder);
+          loadHistory();
+        } else if (data.cancelled) {
+          /* пользователь закрыл диалог — ничего не делаем */
+        } else if (data.error) {
+          formError.textContent = data.error;
+          formError.classList.remove("hidden");
+        }
+      } catch (_) {
+        setWarn(formWarn, "");
+        formError.textContent = "Не удалось открыть выбор папки — впиши путь вручную";
+        formError.classList.remove("hidden");
+      } finally {
+        btnBrowse.disabled = false;
+        btnBrowse.textContent = "Обзор…";
+      }
+    }
+
+    async function resetAndForm() {
+      try {
+        await fetch("/api/reset", { method: "POST" });
+      } catch (_) {}
+      showOnly("form");
+      urlInput.value = "";
+      setWarn(formWarn, "");
+      setWarn(progressWarn, "");
+      setWarn(doneWarn, "");
+      urlInput.focus();
+    }
+
+    $("btn-download").addEventListener("click", startDownload);
+    modeVideo.addEventListener("click", () => setMode("video"));
+    modeAudio.addEventListener("click", () => setMode("audio"));
+    qualitySelect.addEventListener("change", () => {
+      try {
+        localStorage.setItem(QUALITY_KEY, currentQuality());
+      } catch (_) {}
+    });
+    urlInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") startDownload();
+    });
+    folderInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") startDownload();
+    });
+    folderInput.addEventListener("change", () => {
+      saveFolderLocal(currentFolder());
+      updateFooter(currentFolder());
+      loadHistory();
+    });
+
+    btnBrowse.addEventListener("click", browseFolder);
+
+    $("btn-folder").addEventListener("click", async () => {
+      try {
+        await fetch("/api/open-folder", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            folder: lastOutDir || currentFolder() || null,
+          }),
+        });
+      } catch (_) {}
+    });
+
+    $("btn-again").addEventListener("click", resetAndForm);
+    $("btn-retry").addEventListener("click", resetAndForm);
+
+    // При открытии
+    (async () => {
+      try {
+        const res = await fetch("/api/config");
+        const cfg = await res.json();
+        defaultFolder = cfg.default_folder || "";
+      } catch (_) {
+        defaultFolder = "";
+      }
+
+      let saved = "";
+      let savedMode = "video";
+      let savedQuality = "best";
+      try {
+        saved = localStorage.getItem(FOLDER_KEY) || "";
+        savedMode = localStorage.getItem(MODE_KEY) || "video";
+        savedQuality = localStorage.getItem(QUALITY_KEY) || "best";
+      } catch (_) {}
+      folderInput.value = saved || defaultFolder;
+      lastOutDir = folderInput.value;
+      if (["best", "720", "480"].includes(savedQuality)) {
+        qualitySelect.value = savedQuality;
+      } else {
+        qualitySelect.value = "best";
+      }
+      setMode(savedMode);
+      updateFooter(folderInput.value);
+
+      await loadHistory();
+      try {
+        const res = await fetch("/api/status");
+        const s = await res.json();
+        if (s.status === "downloading") {
+          applyStatus(s);
+          startPoll();
+        } else if (s.status === "done" || s.status === "error") {
+          applyStatus(s);
+        }
+      } catch (_) {}
+      urlInput.focus();
+    })();
+  </script>
+</body>
+</html>
