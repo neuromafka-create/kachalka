@@ -7,7 +7,7 @@
 
 #define MyAppName "Качалка"
 #define MyAppNameEn "Kachalka"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "NeyroVibe"
 #define MyAppURL "https://t.me/tekhnocafe"
 #define MyAppExeName "Kachalka.exe"

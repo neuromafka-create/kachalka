@@ -28,7 +28,7 @@ datas += tmp_ret[0]
 binaries = list(tmp_ret[1])
 hiddenimports = list(tmp_ret[2])
 
-for pkg in ("uvicorn", "anyio", "starlette", "fastapi", "webview"):
+for pkg in ("uvicorn", "anyio", "starlette", "fastapi", "webview", "certifi"):
     try:
         r = collect_all(pkg)
         datas += r[0]

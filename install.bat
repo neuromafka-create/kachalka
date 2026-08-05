@@ -20,11 +20,12 @@ echo   Зачем: отдельная папка .venv — Качалка жив
 echo   не трогает в системе. Идёт молча ~30-60 секунд, это нормально.
 if not exist ".venv\Scripts\python.exe" python -m venv .venv
 echo.
-echo [2/3] Ставлю yt-dlp, fastapi, uvicorn, pywebview...
+echo [2/3] Ставлю yt-dlp, fastapi, uvicorn, pywebview, certifi...
 echo   Зачем: yt-dlp — скачивание; fastapi/uvicorn — движок окна;
-echo   pywebview — привычное окно программы без браузера.
+echo   pywebview — привычное окно программы без браузера;
+echo   certifi — сертификаты HTTPS (без них VK и др. сайты могут падать по SSL).
 ".venv\Scripts\python.exe" -m pip install --upgrade pip -q
-".venv\Scripts\python.exe" -m pip install yt-dlp fastapi "uvicorn[standard]" pywebview -q
+".venv\Scripts\python.exe" -m pip install yt-dlp fastapi "uvicorn[standard]" pywebview certifi -q
 echo.
 echo [3/3] Скачиваю портативный ffmpeg (~90 МБ, один раз)...
 echo   Зачем: склеивает видеодорожку со звуком — без него YouTube отдаёт

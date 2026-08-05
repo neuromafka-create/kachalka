@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -11,12 +12,105 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 import yt_dlp
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+
+def _configure_ssl_certs() -> None:
+    """Подключить Mozilla CA (certifi), иначе на Windows OpenSSL часто
+    не находит issuer для vk.com и падает с CERTIFICATE_VERIFY_FAILED.
+    """
+    try:
+        import certifi
+        import ssl
+    except ImportError:
+        return
+
+    ca = certifi.where()
+    if not Path(ca).is_file():
+        return
+
+    # yt-dlp / urllib / OpenSSL читают эти переменные
+    os.environ.setdefault("SSL_CERT_FILE", ca)
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", ca)
+    os.environ.setdefault("CURL_CA_BUNDLE", ca)
+
+    # urllib в Python берёт default context один раз — зафиксируем cafile явно
+    def _https_context() -> ssl.SSLContext:
+        return ssl.create_default_context(cafile=ca)
+
+    ssl._create_default_https_context = _https_context  # type: ignore[assignment]
+
+
+_configure_ssl_certs()
+
+
+# С июля 2026 VK рекомендует vk.ru вместо vk.com («быстрее и надёжнее»).
+# Старые ссылки .com и vkvideo.ru по-прежнему принимаем.
+VK_PREFERRED_HOST = "vk.ru"
+VK_API_HOSTS = ("vk.ru", "vk.com")  # порядок: сначала .ru, запасной .com
+
+
+def _patch_yt_dlp_vk_prefer_ru() -> None:
+    """yt-dlp ходит в al_video.php на vk.com — переключаем на vk.ru с fallback."""
+    try:
+        from yt_dlp.extractor.vk import VKBaseIE
+        from yt_dlp.utils import ExtractorError, clean_html, urlencode_postdata
+    except ImportError:
+        return
+    if getattr(VKBaseIE, "_kachalka_vk_ru", False):
+        return
+
+    def _download_payload(self, path, video_id, data, fatal=True):  # noqa: ANN001
+        payload_data = dict(data)
+        payload_data["al"] = 1
+        last_err: BaseException | None = None
+        for i, host in enumerate(VK_API_HOSTS):
+            endpoint = f"https://{host}/{path}.php"
+            is_last = i == len(VK_API_HOSTS) - 1
+            try:
+                resp = self._download_json(
+                    endpoint,
+                    video_id,
+                    data=urlencode_postdata(payload_data),
+                    fatal=fatal if is_last else False,
+                    headers={
+                        "Referer": endpoint,
+                        "X-Requested-With": "XMLHttpRequest",
+                    },
+                )
+                if not resp or "payload" not in resp:
+                    continue
+                code, payload = resp["payload"]
+                if code == "3":
+                    self.raise_login_required()
+                elif code == "8":
+                    raise ExtractorError(
+                        clean_html(payload[0][1:-1]), expected=True
+                    )
+                return payload
+            except ExtractorError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                continue
+        if fatal and last_err is not None:
+            raise last_err
+        if fatal:
+            raise ExtractorError("Unable to download VK JSON metadata")
+        return None
+
+    VKBaseIE._download_payload = _download_payload  # type: ignore[method-assign]
+    VKBaseIE._kachalka_vk_ru = True
+
+
+_patch_yt_dlp_vk_prefer_ru()
+
 
 def _app_dir() -> Path:
     """Папка приложения: рядом с .exe (сборка) или с исходниками (разработка).
@@ -50,30 +144,67 @@ STATIC = RESOURCE / "static"
 if not STATIC.is_dir():
     STATIC = BASE / "static"
 
-# Форматы видео: лучший mp4 со склейкой + ограничения по высоте
+# Форматы видео: progressive mp4 (VK url720/url1080) + DASH/HLS fallback
 QUALITY_BEST = "best"
 QUALITY_720 = "720"
 QUALITY_480 = "480"
 FORMAT_BY_QUALITY: dict[str, str] = {
-    # Как в kachalka.py — лучшее mp4, иначе что есть
-    QUALITY_BEST: "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
-    # Не выше 720p: mp4 если можно, иначе любой <=720
+    # Лучшее: progressive mp4, иначе склейка DASH/HLS, иначе что угодно
+    QUALITY_BEST: (
+        "b[ext=mp4]/"
+        "bv*[ext=mp4]+ba[ext=m4a]/"
+        "bv*+ba/"
+        "b"
+    ),
+    # Не выше 720p
     QUALITY_720: (
-        "bv*[height<=720][ext=mp4]+ba[ext=m4a]/"
         "b[height<=720][ext=mp4]/"
+        "bv*[height<=720][ext=mp4]+ba[ext=m4a]/"
         "bv*[height<=720]+ba/"
-        "b[height<=720]"
+        "b[height<=720]/"
+        "b"
     ),
     # Не выше 480p — совсем лёгкое
     QUALITY_480: (
-        "bv*[height<=480][ext=mp4]+ba[ext=m4a]/"
         "b[height<=480][ext=mp4]/"
+        "bv*[height<=480][ext=mp4]+ba[ext=m4a]/"
         "bv*[height<=480]+ba/"
-        "b[height<=480]"
+        "b[height<=480]/"
+        "b"
     ),
 }
 MODE_VIDEO = "video"
 MODE_AUDIO = "audio"
+
+# Браузеры для cookies-from-browser (yt-dlp)
+BROWSER_CHOICES = ("chrome", "edge", "firefox", "opera", "brave", "chromium")
+# Имена файла cookies (Netscape) рядом с exe / в «Скачанное»
+COOKIES_FILE_NAMES = (
+    "cookies.txt",
+    "vk_cookies.txt",
+    "youtube_cookies.txt",
+)
+
+# Реалистичный UA — VK иногда режет «голый» Python
+_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+# id вида -123_456 или 123_456
+_VK_VIDEO_ID_RE = re.compile(
+    r"(?:video|clip)(-?\d+_\d+)|z=video(-?\d+_\d+)",
+    re.IGNORECASE,
+)
+# vk.com, vk.ru, m.vk.*, new.vk.*, vkvideo.ru, vksport.vkvideo.ru, …
+_VK_HOST_RE = re.compile(
+    r"(?:^|\.)(?:vk\.(?:com|ru)|vkvideo\.ru)$",
+    re.IGNORECASE,
+)
 
 app = FastAPI(title="Качалка")
 
@@ -112,24 +243,165 @@ def _format_speed(n: float | int | None) -> str:
     return f"{_format_bytes(n)}/с"
 
 
-def _human_error(exc: BaseException) -> str:
+def _is_vk_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    # vk.com / vk.ru / m.vk.ru / new.vk.com / vkvideo.ru / vksport.vkvideo.ru
+    return bool(_VK_HOST_RE.search(host))
+
+
+def _normalize_url(url: str) -> str:
+    """Почистить вставку из буфера: пробелы, кавычки, текст вокруг, //vk…, z=video.
+    Канон для ВК — vk.ru (с июля 2026 основной домен; .com ещё жив как зеркало).
+    """
+    s = (url or "").strip().strip("\"'<>")
+    if not s:
+        return s
+
+    # Вытащить первый URL, если скопировали с подписью
+    m = re.search(r"https?://[^\s<>\"']+", s)
+    if m:
+        s = m.group(0)
+    else:
+        m = re.search(
+            r"(?:(?:m|new|vksport)\.)?vk(?:video)?\.(?:com|ru)/[^\s<>\"']+",
+            s,
+            re.IGNORECASE,
+        )
+        if m:
+            s = "https://" + m.group(0).lstrip("/")
+
+    s = s.rstrip(").,;]'\"")
+
+    # Ссылка без схемы
+    if s.startswith("//"):
+        s = "https:" + s
+    elif re.match(r"^(?:[\w-]+\.)?(?:vk|vkvideo)\.(?:com|ru)/", s, re.I):
+        s = "https://" + s
+
+    # Старые .com → .ru (тот же путь; видео/клипы/wall)
+    try:
+        parsed = urlparse(s)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        parsed = None
+        host = ""
+    if host in ("vk.com", "m.vk.com", "new.vk.com", "www.vk.com"):
+        new_host = host.replace("vk.com", VK_PREFERRED_HOST)
+        s = parsed._replace(netloc=new_host).geturl()  # type: ignore[union-attr]
+
+    # VK: z=video-123_456 / clip… → канонический video-id на vk.ru
+    if _is_vk_url(s):
+        vid = None
+        found = _VK_VIDEO_ID_RE.search(s)
+        if found:
+            vid = found.group(1) or found.group(2)
+        if not vid:
+            qs = parse_qs(urlparse(s).query)
+            z = unquote((qs.get("z") or [""])[0])
+            zm = re.search(r"video(-?\d+_\d+)", z, re.I)
+            if zm:
+                vid = zm.group(1)
+        if vid:
+            # list= полезен для части удалённых/плейлистных роликов
+            list_id = None
+            lm = re.search(r"[?&]list=([^&]+)", s)
+            if lm:
+                list_id = unquote(lm.group(1))
+            base = f"https://{VK_PREFERRED_HOST}/video{vid}"
+            if list_id:
+                base += f"?list={list_id}"
+            return base
+
+    return s
+
+
+def _find_cookies_file() -> Path | None:
+    """cookies.txt рядом с программой или в папке «Скачанное»."""
+    dirs = (BASE, DEFAULT_OUT)
+    for d in dirs:
+        for name in COOKIES_FILE_NAMES:
+            p = d / name
+            if p.is_file() and p.stat().st_size > 0:
+                return p
+    return None
+
+
+def _normalize_browser(browser: str | None) -> str | None:
+    if not browser:
+        return None
+    b = browser.strip().lower()
+    if b in ("", "none", "off", "0", "false", "no"):
+        return None
+    if b in BROWSER_CHOICES:
+        return b
+    return None
+
+
+def _human_error(exc: BaseException, *, url: str = "") -> str:
     msg = str(exc).strip()
     low = msg.lower()
+    vk = (
+        _is_vk_url(url)
+        or "[vk]" in low
+        or "vk.com" in low
+        or "vk.ru" in low
+        or "vkvideo" in low
+    )
+
     if "unsupported url" in low or "no suitable extractor" in low:
         return "Ссылка не открылась — такой сайт не поддерживается"
-    if "private video" in low or "sign in to confirm" in low or "login required" in low:
-        return "Видео недоступно — оно закрыто или требует входа"
+    if "failed to decrypt with dpapi" in low or "could not copy" in low and "cookie" in low:
+        return (
+            "Не удалось прочитать cookies браузера (Windows DPAPI). "
+            "Закрой браузер и попробуй снова, либо положи cookies.txt "
+            "рядом с Качалкой (экспорт расширением «Get cookies.txt LOCALLY»)"
+        )
+    if (
+        "private video" in low
+        or "sign in to confirm" in low
+        or "login required" in low
+        or "only available for registered" in low
+        or "access restricted" in low
+        or "access denied" in low
+    ):
+        if vk:
+            return (
+                "ВК: видео закрыто или нужен вход. "
+                "Включи «cookies браузера» (будь в аккаунте ВК) "
+                "или положи cookies.txt рядом с Качалкой"
+            )
+        return "Видео недоступно — оно закрыто, ограничено по региону или требует входа"
+    if "not available in your region" in low or "недоступно в вашем регионе" in low:
+        return "Видео недоступно в твоём регионе"
     if (
         "video unavailable" in low
         or "not available" in low
         or "has been removed" in low
         or "is not available" in low
+        or "was removed" in low
+        or "author has been blocked" in low
     ):
-        return "Видео недоступно"
+        return "Видео недоступно — удалено или автор заблокирован"
     if "http error 404" in low or "unable to download webpage" in low:
         return "Ссылка не открылась — страница не найдена"
     if "http error 403" in low:
         return "Видео недоступно — доступ запрещён"
+    if (
+        "certificate_verify_failed" in low
+        or "certificate verify failed" in low
+        or "ssl: certificate" in low
+        or "unable to get local issuer certificate" in low
+    ):
+        return (
+            "Не удалось проверить защищённое соединение (SSL). "
+            "Часто помогает: перезапусти install.bat или отключи "
+            "«проверку HTTPS» в антивирусе"
+        )
     if any(
         k in low
         for k in (
@@ -250,6 +522,9 @@ def _ydl_opts(
     out_dir: Path,
     mode: str = MODE_VIDEO,
     quality: str = QUALITY_BEST,
+    *,
+    cookies_file: Path | None = None,
+    cookies_browser: str | None = None,
 ) -> dict[str, Any]:
     """Опции yt-dlp: видео (mp4 + качество) или только звук (mp3)."""
     opts: dict[str, Any] = {
@@ -259,10 +534,22 @@ def _ydl_opts(
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        "http_headers": dict(_HTTP_HEADERS),
+        # Чуть устойчивее к обрывам (VK/CDN)
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 3,
     }
     # ffmpeg нужен и для склейки mp4, и для конвертации в mp3
     if (FFMPEG_BIN / "ffmpeg.exe").exists():
         opts["ffmpeg_location"] = str(FFMPEG_BIN)
+
+    # Cookies: файл важнее (явный экспорт), иначе браузер
+    if cookies_file is not None and cookies_file.is_file():
+        opts["cookiefile"] = str(cookies_file)
+    elif cookies_browser:
+        # yt-dlp: cookiesfrombrowser = (browser, profile, keyring, container)
+        opts["cookiesfrombrowser"] = (cookies_browser,)
 
     if mode == MODE_AUDIO:
         # Эквивалент CLI: -x --audio-format mp3
@@ -308,20 +595,46 @@ def _final_path(ydl: yt_dlp.YoutubeDL, info: dict[str, Any], mode: str) -> Path:
     return prepared
 
 
+def _needs_auth_retry(exc: BaseException) -> bool:
+    low = str(exc).lower()
+    return any(
+        k in low
+        for k in (
+            "access restricted",
+            "access denied",
+            "login required",
+            "only available for registered",
+            "private video",
+            "sign in",
+        )
+    )
+
+
 def _do_download(
     url: str,
     folder: str | None,
     mode: str = MODE_VIDEO,
     quality: str = QUALITY_BEST,
+    cookies_browser: str | None = None,
 ) -> None:
     mode = _normalize_mode(mode)
     quality = _normalize_quality(quality)
+    url = _normalize_url(url)
+    browser = _normalize_browser(cookies_browser)
+    cookies_file = _find_cookies_file()
+
     try:
         out_dir, warning = _resolve_out_dir(folder)
         if mode == MODE_AUDIO and not (FFMPEG_BIN / "ffmpeg.exe").exists():
             warning = (
                 (warning + " ") if warning else ""
             ) + "ffmpeg не найден — mp3 может не получиться. Запусти install.bat."
+        if cookies_file is not None:
+            hint = f"Cookies: {cookies_file.name}"
+            warning = f"{warning} {hint}".strip() if warning else hint
+        elif browser:
+            hint = f"Cookies из браузера: {browser}"
+            warning = f"{warning} {hint}".strip() if warning else hint
 
         with _lock:
             _state.update(
@@ -340,27 +653,75 @@ def _do_download(
                 }
             )
 
-        with yt_dlp.YoutubeDL(_ydl_opts(out_dir, mode, quality)) as ydl:
-            info = ydl.extract_info(url, download=True)
-            default_title = "Аудио" if mode == MODE_AUDIO else "Видео"
-            title = (info or {}).get("title") or default_title
-            path = _final_path(ydl, info or {}, mode)
+        def _run(
+            *,
+            use_file: Path | None,
+            use_browser: str | None,
+        ) -> tuple[Any, Path]:
+            opts = _ydl_opts(
+                out_dir,
+                mode,
+                quality,
+                cookies_file=use_file,
+                cookies_browser=use_browser,
+            )
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                path = _final_path(ydl, info or {}, mode)
+                return info, path
 
-            with _lock:
-                _state["status"] = "done"
-                _state["title"] = title
-                _state["filename"] = path.name if path.exists() else path.name
-                _state["percent"] = 100.0
-                _state["speed"] = ""
-                _state["out_dir"] = str(out_dir)
-                _state["mode"] = mode
-                _state["quality"] = quality
-                if path.exists():
-                    _state["size"] = _format_bytes(path.stat().st_size)
+        try:
+            info, path = _run(use_file=cookies_file, use_browser=browser)
+        except Exception as first_exc:  # noqa: BLE001
+            # ВК: закрытое видео — один авто-повтор с cookies браузера (Edge→Chrome→Firefox)
+            if (
+                _is_vk_url(url)
+                and _needs_auth_retry(first_exc)
+                and cookies_file is None
+                and browser is None
+            ):
+                last_exc: BaseException = first_exc
+                for b in ("edge", "chrome", "firefox"):
+                    try:
+                        with _lock:
+                            _state["warning"] = (
+                                (warning + " " if warning else "")
+                                + f"Пробую cookies из {b}…"
+                            ).strip()
+                        info, path = _run(use_file=None, use_browser=b)
+                        last_exc = None  # type: ignore[assignment]
+                        with _lock:
+                            _state["warning"] = (
+                                (warning + " " if warning else "")
+                                + f"Вошёл через cookies {b}"
+                            ).strip()
+                        break
+                    except Exception as retry_exc:  # noqa: BLE001
+                        last_exc = retry_exc
+                        continue
+                if last_exc is not None:
+                    raise last_exc from first_exc
+            else:
+                raise
+
+        default_title = "Аудио" if mode == MODE_AUDIO else "Видео"
+        title = (info or {}).get("title") or default_title
+
+        with _lock:
+            _state["status"] = "done"
+            _state["title"] = title
+            _state["filename"] = path.name if path.exists() else path.name
+            _state["percent"] = 100.0
+            _state["speed"] = ""
+            _state["out_dir"] = str(out_dir)
+            _state["mode"] = mode
+            _state["quality"] = quality
+            if path.exists():
+                _state["size"] = _format_bytes(path.stat().st_size)
     except Exception as exc:  # noqa: BLE001 — показываем ошибку на странице, сервер жив
         with _lock:
             _state["status"] = "error"
-            _state["error"] = _human_error(exc)
+            _state["error"] = _human_error(exc, url=url)
             _state["speed"] = ""
             _state["percent"] = 0.0
 
@@ -370,6 +731,8 @@ class DownloadRequest(BaseModel):
     folder: str | None = None
     mode: str | None = MODE_VIDEO  # video | audio
     quality: str | None = QUALITY_BEST  # best | 720 | 480
+    # none | chrome | edge | firefox | opera | brave | chromium
+    cookies_browser: str | None = None
 
 
 class OpenFolderRequest(BaseModel):
@@ -383,9 +746,13 @@ def index() -> FileResponse:
 
 @app.get("/api/config")
 def get_config() -> dict[str, Any]:
+    cookies = _find_cookies_file()
     return {
         "default_folder": str(DEFAULT_OUT),
         "default_folder_label": "Скачанное",
+        "cookies_file": str(cookies) if cookies else None,
+        "cookies_file_name": cookies.name if cookies else None,
+        "browsers": list(BROWSER_CHOICES),
     }
 
 
@@ -490,7 +857,7 @@ def browse_folder(req: BrowseFolderRequest | None = None) -> dict[str, Any]:
 
 @app.post("/api/download")
 def start_download(req: DownloadRequest) -> dict[str, Any]:
-    url = (req.url or "").strip()
+    url = _normalize_url(req.url or "")
     if not url.startswith("http"):
         return {
             "ok": False,
@@ -506,15 +873,23 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
 
     mode = _normalize_mode(req.mode)
     quality = _normalize_quality(req.quality)
+    cookies_browser = _normalize_browser(req.cookies_browser)
+    cookies_file = _find_cookies_file()
     # Предпросмотр папки (создастся ещё раз в потоке скачивания)
     out_dir, warning = _resolve_out_dir(req.folder)
     if mode == MODE_AUDIO and not (FFMPEG_BIN / "ffmpeg.exe").exists():
         extra = "ffmpeg не найден — mp3 может не получиться. Запусти install.bat."
         warning = f"{warning} {extra}".strip() if warning else extra
+    if cookies_file is not None:
+        extra = f"Найден {cookies_file.name} — использую для входа"
+        warning = f"{warning} {extra}".strip() if warning else extra
+    elif cookies_browser:
+        extra = f"Буду брать cookies из {cookies_browser}"
+        warning = f"{warning} {extra}".strip() if warning else extra
 
     thread = threading.Thread(
         target=_do_download,
-        args=(url, req.folder, mode, quality),
+        args=(url, req.folder, mode, quality, cookies_browser),
         daemon=True,
     )
     thread.start()
@@ -524,6 +899,9 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
         "warning": warning,
         "mode": mode,
         "quality": quality,
+        "url": url,
+        "cookies_browser": cookies_browser,
+        "cookies_file": str(cookies_file) if cookies_file else None,
     }
 
 

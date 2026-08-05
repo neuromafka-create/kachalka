@@ -31,6 +31,12 @@ if exist ".venv\Scripts\python.exe" (
   ) else (
     echo [OK] yt-dlp установлен
   )
+  ".venv\Scripts\python.exe" -c "import certifi; import pathlib; assert pathlib.Path(certifi.where()).is_file()" >nul 2>nul
+  if errorlevel 1 (
+    echo [!?] certifi нет — HTTPS/VK могут падать. Запусти install.bat
+  ) else (
+    echo [OK] certifi ^(SSL-сертификаты^) на месте
+  )
 )
 
 if exist "ffmpeg\bin\ffmpeg.exe" (
