@@ -40,6 +40,7 @@ for pkg in ("uvicorn", "anyio", "starlette", "fastapi", "webview", "certifi"):
 hiddenimports += collect_submodules("uvicorn")
 hiddenimports += [
     "app",
+    "page_videos",
     "pick_folder",
     "uvicorn.logging",
     "uvicorn.loops",

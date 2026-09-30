@@ -409,6 +409,50 @@
       text-align: center;
     }
 
+    .embed-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    button.embed-item {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 2px;
+      width: 100%;
+      text-align: left;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: var(--bg-input);
+      color: var(--text);
+      border: 1px solid var(--border);
+      font-weight: 500;
+    }
+
+    button.embed-item:hover:not(:disabled) {
+      border-color: #3d4458;
+    }
+
+    button.embed-item.selected {
+      border-color: rgba(108, 140, 255, 0.55);
+      background: var(--accent-dim);
+    }
+
+    .embed-title {
+      font-size: 0.92rem;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .embed-url {
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 400;
+      line-height: 1.35;
+      word-break: break-all;
+    }
+
     .hidden { display: none !important; }
 
     footer {
@@ -439,21 +483,29 @@
         </svg>
       </div>
       <h1>Качалка</h1>
-      <p class="subtitle">Вставь ссылку — сохрани видео или только звук</p>
+      <p class="subtitle">Ссылка на ролик или на страницу, где он встроен</p>
     </header>
 
     <div class="card">
       <!-- Форма ввода -->
       <div id="panel-form">
         <div class="field">
-          <label class="field-label" for="url">Ссылка на видео</label>
+          <label class="field-label" for="url">Ссылка на видео или страницу</label>
           <input
             id="url"
             type="url"
-            placeholder="YouTube, vk.ru, vkvideo.ru, Rutube…"
+            placeholder="YouTube, vk.ru или страница, где ролик встроен"
             autocomplete="off"
             spellcheck="false"
           />
+          <p class="field-hint">
+            Можно вставить адрес статьи: Качалка найдёт плеер YouTube, ВК, Rutube или файл mp4 на странице.
+          </p>
+        </div>
+
+        <div class="field hidden" id="field-embeds">
+          <span class="field-label">Какой ролик скачать</span>
+          <div class="embed-list" id="embed-list" role="listbox" aria-label="Ролики на странице"></div>
         </div>
 
         <div class="field">
@@ -599,6 +651,10 @@
     let defaultFolder = "";
     let lastOutDir = "";
     let currentMode = "video";
+    let pickedUrl = "";
+    let pickedPage = "";
+    let downloadBusy = false;
+    let activeEmbedHint = "";
 
     function currentQuality() {
       const q = (qualitySelect.value || "best").toLowerCase();
@@ -721,7 +777,10 @@
         statusLine.textContent = s.title
           ? "Скачиваю" + modeHint + ": " + s.title
           : "Скачиваю" + modeHint + "…";
-        setWarn(progressWarn, s.warning || "");
+        const hintParts = [];
+        if (activeEmbedHint) hintParts.push(activeEmbedHint);
+        if (s.warning) hintParts.push(s.warning);
+        setWarn(progressWarn, hintParts.join(" "));
         if (s.out_dir) updateFooter(s.out_dir);
       } else if (s.status === "done") {
         stopPoll();
@@ -765,31 +824,118 @@
       pollTimer = setInterval(pollStatus, 1000);
     }
 
+    function clearEmbeds() {
+      pickedUrl = "";
+      pickedPage = "";
+      $("embed-list").innerHTML = "";
+      $("field-embeds").classList.add("hidden");
+      btnDownload.textContent = "Скачать";
+    }
+
+    function showEmbeds(pageUrl, videos) {
+      pickedPage = pageUrl;
+      const list = $("embed-list");
+      list.innerHTML = "";
+      videos.forEach((video, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "embed-item" + (index === 0 ? " selected" : "");
+        button.setAttribute("role", "option");
+        button.setAttribute("aria-selected", index === 0 ? "true" : "false");
+        const title = document.createElement("span");
+        title.className = "embed-title";
+        title.textContent = video.title || "Видео";
+        const address = document.createElement("span");
+        address.className = "embed-url";
+        address.textContent = video.url;
+        button.appendChild(title);
+        button.appendChild(address);
+        button.addEventListener("click", () => {
+          pickedUrl = video.url;
+          list.querySelectorAll(".embed-item").forEach((el) => {
+            el.classList.remove("selected");
+            el.setAttribute("aria-selected", "false");
+          });
+          button.classList.add("selected");
+          button.setAttribute("aria-selected", "true");
+        });
+        list.appendChild(button);
+      });
+      pickedUrl = videos[0].url;
+      $("field-embeds").classList.remove("hidden");
+      btnDownload.textContent = "Скачать выбранное";
+      setWarn(formWarn, "На странице несколько роликов — выбери, какой скачать.");
+    }
+
+    async function resolveTarget(url) {
+      if (pickedUrl && pickedPage === url) {
+        return { url: pickedUrl, hint: "" };
+      }
+      clearEmbeds();
+      btnDownload.textContent = "Ищу видео…";
+      const res = await fetch("/api/inspect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      const info = await res.json();
+      if (!info.ok) {
+        const error = new Error(info.error || "Не удалось открыть страницу");
+        error.userMessage = error.message;
+        throw error;
+      }
+      const videos = info.videos || [];
+      if (info.mode === "embeds" && videos.length > 1) {
+        showEmbeds(url, videos);
+        return null;
+      }
+      if (info.mode === "embeds" && videos.length === 1) {
+        const title = videos[0].title || "видео";
+        return {
+          url: videos[0].url,
+          hint: "На странице нашёл встроенное видео «" + title + "». Качаю его.",
+        };
+      }
+      if (info.scanned) {
+        return {
+          url,
+          hint: "Встроенного плеера не нашёл — пробую скачать саму ссылку.",
+        };
+      }
+      return { url, hint: "" };
+    }
+
     async function startDownload() {
+      if (downloadBusy) return;
       const url = urlInput.value.trim();
       formError.classList.add("hidden");
       setWarn(formWarn, "");
 
       if (!url) {
-        formError.textContent = "Вставь ссылку на видео";
+        formError.textContent = "Вставь ссылку на видео или на страницу";
         formError.classList.remove("hidden");
         urlInput.focus();
         return;
       }
 
       const folder = currentFolder();
+      downloadBusy = true;
       btnDownload.disabled = true;
       btnBrowse.disabled = true;
       modeVideo.disabled = true;
       modeAudio.disabled = true;
       qualitySelect.disabled = true;
       if (cookiesSelect) cookiesSelect.disabled = true;
+      let embedHint = "";
       try {
+        const target = await resolveTarget(url);
+        if (!target) return;
+        embedHint = target.hint || "";
         const res = await fetch("/api/download", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            url,
+            url: target.url,
             folder: folder || null,
             mode: currentMode,
             quality: currentMode === "video" ? currentQuality() : "best",
@@ -808,7 +954,11 @@
           saveFolderLocal(data.out_dir);
           updateFooter(data.out_dir);
         }
-        setWarn(progressWarn, data.warning || "");
+        activeEmbedHint = embedHint || "";
+        const hints = [];
+        if (embedHint) hints.push(embedHint);
+        if (data.warning) hints.push(data.warning);
+        setWarn(progressWarn, hints.join(" "));
         showOnly("progress");
         pctEl.textContent = "0%";
         barFill.style.width = "0%";
@@ -819,16 +969,21 @@
         else if (currentQuality() === "480") startHint = "Скачиваю (до 480p)…";
         statusLine.textContent = startHint;
         startPoll();
-      } catch (_) {
-        formError.textContent = "Нет связи с сервером — перезапусти start.bat";
+      } catch (err) {
+        formError.textContent =
+          (err && err.userMessage) || "Нет связи с сервером — перезапусти start.bat";
         formError.classList.remove("hidden");
       } finally {
+        downloadBusy = false;
         btnDownload.disabled = false;
         btnBrowse.disabled = false;
         modeVideo.disabled = false;
         modeAudio.disabled = false;
         qualitySelect.disabled = currentMode !== "video";
         if (cookiesSelect) cookiesSelect.disabled = false;
+        if ($("field-embeds").classList.contains("hidden")) {
+          btnDownload.textContent = "Скачать";
+        }
       }
     }
 
@@ -872,6 +1027,8 @@
       } catch (_) {}
       showOnly("form");
       urlInput.value = "";
+      activeEmbedHint = "";
+      clearEmbeds();
       setWarn(formWarn, "");
       setWarn(progressWarn, "");
       setWarn(doneWarn, "");
@@ -893,6 +1050,9 @@
         } catch (_) {}
       });
     }
+    urlInput.addEventListener("input", () => {
+      if (pickedPage && urlInput.value.trim() !== pickedPage) clearEmbeds();
+    });
     urlInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") startDownload();
     });

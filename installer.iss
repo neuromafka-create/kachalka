@@ -7,7 +7,7 @@
 
 #define MyAppName "Качалка"
 #define MyAppNameEn "Kachalka"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "NeyroVibe"
 #define MyAppURL "https://t.me/tekhnocafe"
 #define MyAppExeName "Kachalka.exe"
@@ -30,7 +30,17 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
+; Тот же AppId: повторный запуск Setup обновляет копию в %LocalAppData%\Kachalka.
+; Папку «Скачанное» установщик не удаляет — её нет в списке файлов.
+UsePreviousAppDir=yes
+UsePreviousGroup=yes
+UsePreviousTasks=yes
 CloseApplications=yes
+CloseApplicationsFilter=Kachalka.exe
+; Запуск после установки — только галочка в мастере, без второго окна.
+RestartApplications=no
+VersionInfoVersion=1.2.0.0
+VersionInfoProductVersion=1.2.0.0
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"

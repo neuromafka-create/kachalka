@@ -98,15 +98,45 @@ def _find_cookies_file() -> Path | None:
     return None
 
 
+def _pick_embedded(url: str) -> str:
+    """Если вставили адрес статьи — взять встроенный ролик."""
+    try:
+        import page_videos
+    except ImportError:
+        return url
+    found = page_videos.inspect_page(url)
+    videos = list(found.get("videos") or [])
+    if found.get("mode") != "embeds" or not videos:
+        if found.get("scanned"):
+            print("Встроенного плеера на странице не нашёл — пробую скачать саму ссылку.\n")
+        return url
+    if len(videos) == 1:
+        print(f"На странице нашёл встроенное видео: {videos[0]['title']}")
+        print(videos[0]["url"])
+        return str(videos[0]["url"])
+    print("На странице несколько роликов:")
+    for i, item in enumerate(videos, 1):
+        print(f"  {i}. {item['title']}")
+        print(f"     {item['url']}")
+    raw = input("Номер ролика (Enter — первый): ").strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(videos):
+        return str(videos[int(raw) - 1]["url"])
+    print("Беру первый.")
+    return str(videos[0]["url"])
+
+
 def main() -> None:
     _configure_ssl_certs()
     print("=" * 52)
     print("  ⬇  КАЧАЛКА — скачиватель видео (кирпичик yt-dlp)")
     print("=" * 52)
-    url = _normalize_url(input("\nВставь ссылку на видео и нажми Enter:\n> "))
+    url = _normalize_url(
+        input("\nВставь ссылку на видео или на страницу, где оно встроено:\n> ")
+    )
     if not url.startswith("http"):
         print("\n[!] Это не похоже на ссылку. Запусти ещё раз и вставь адрес вида https://…")
         return
+    url = _pick_embedded(url)
     OUT.mkdir(exist_ok=True)
     print(f"\nСкачиваю в папку: {OUT}")
     print(f"Ссылка: {url}\n")

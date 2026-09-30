@@ -16,6 +16,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import yt_dlp
 from fastapi import FastAPI, Query
+
+import page_videos
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -735,6 +737,32 @@ class DownloadRequest(BaseModel):
     cookies_browser: str | None = None
 
 
+class InspectRequest(BaseModel):
+    url: str
+
+
+def _present_found(videos: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Повторно прогнать найденные адреса через нормализацию ВК и убрать дубли."""
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in videos:
+        url = _normalize_url(str(item.get("url") or ""))
+        if not url.startswith("http") or url in seen:
+            continue
+        seen.add(url)
+        title = str(item.get("title") or "").strip() or "Видео"
+        out.append(
+            {
+                "url": url,
+                "title": title[:140],
+                "kind": str(item.get("kind") or ""),
+            }
+        )
+        if len(out) >= 12:
+            break
+    return out
+
+
 class OpenFolderRequest(BaseModel):
     folder: str | None = None
 
@@ -855,6 +883,32 @@ def browse_folder(req: BrowseFolderRequest | None = None) -> dict[str, Any]:
     return _browse_folder_dialog(str(initial))
 
 
+@app.post("/api/inspect")
+def inspect_link(req: InspectRequest) -> dict[str, Any]:
+    """Найти ролики, встроенные в обычную страницу.
+
+    Прямую ссылку на ролик возвращает как mode=direct — её качаем как раньше.
+    """
+    url = _normalize_url(req.url or "")
+    if not url.startswith("http"):
+        return {
+            "ok": False,
+            "error": "Это не похоже на ссылку. Вставь адрес вида https://…",
+        }
+    found = page_videos.inspect_page(url)
+    videos = _present_found(list(found.get("videos") or []))
+    mode = str(found.get("mode") or "direct")
+    if mode == "embeds" and not videos:
+        mode = "direct"
+    return {
+        "ok": True,
+        "mode": mode,
+        "videos": videos,
+        "scanned": bool(found.get("scanned")),
+        "page_url": url,
+    }
+
+
 @app.post("/api/download")
 def start_download(req: DownloadRequest) -> dict[str, Any]:
     url = _normalize_url(req.url or "")
@@ -887,6 +941,24 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
         extra = f"Буду брать cookies из {cookies_browser}"
         warning = f"{warning} {extra}".strip() if warning else extra
 
+    # Статус до запуска потока: иначе первый опрос ещё видит idle
+    # и окно прячет прогресс, будто кнопка ничего не сделала.
+    with _lock:
+        _state.update(
+            {
+                "status": "downloading",
+                "percent": 0.0,
+                "speed": "",
+                "size": "",
+                "title": "",
+                "filename": "",
+                "error": "",
+                "out_dir": str(out_dir),
+                "warning": warning,
+                "mode": mode,
+                "quality": quality,
+            }
+        )
     thread = threading.Thread(
         target=_do_download,
         args=(url, req.folder, mode, quality, cookies_browser),
