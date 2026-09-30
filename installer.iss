@@ -7,7 +7,7 @@
 
 #define MyAppName "Качалка"
 #define MyAppNameEn "Kachalka"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.1"
 #define MyAppPublisher "NeyroVibe"
 #define MyAppURL "https://t.me/tekhnocafe"
 #define MyAppExeName "Kachalka.exe"
@@ -39,8 +39,8 @@ CloseApplications=yes
 CloseApplicationsFilter=Kachalka.exe
 ; Запуск после установки — только галочка в мастере, без второго окна.
 RestartApplications=no
-VersionInfoVersion=1.2.0.0
-VersionInfoProductVersion=1.2.0.0
+VersionInfoVersion=1.2.1.0
+VersionInfoProductVersion=1.2.1.0
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"

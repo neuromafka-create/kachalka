@@ -245,6 +245,25 @@ def _format_speed(n: float | int | None) -> str:
     return f"{_format_bytes(n)}/с"
 
 
+def _is_youtube_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        return False
+    return (
+        host == "youtu.be"
+        or host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host.endswith("youtube-nocookie.com")
+    )
+
+
+def _youtube_cdn_blocked(exc: BaseException) -> bool:
+    """YouTube описал ролик, но CDN не отдал сам файл (часто у открытых видео)."""
+    low = str(exc).lower()
+    return "http error 403" in low or "403: forbidden" in low
+
+
 def _is_vk_url(url: str) -> bool:
     try:
         host = (urlparse(url).hostname or "").lower()
@@ -391,7 +410,12 @@ def _human_error(exc: BaseException, *, url: str = "") -> str:
         return "Видео недоступно — удалено или автор заблокирован"
     if "http error 404" in low or "unable to download webpage" in low:
         return "Ссылка не открылась — страница не найдена"
-    if "http error 403" in low:
+    if "http error 403" in low or "403: forbidden" in low:
+        if _is_youtube_url(url) or "[youtube]" in low:
+            return (
+                "YouTube не отдал файл. Ролик может быть открытым — "
+                "так сайт режет скачивание (ошибка 403). Попробуй ещё раз чуть позже"
+            )
         return "Видео недоступно — доступ запрещён"
     if (
         "certificate_verify_failed" in low
@@ -527,6 +551,7 @@ def _ydl_opts(
     *,
     cookies_file: Path | None = None,
     cookies_browser: str | None = None,
+    player_clients: list[str] | None = None,
 ) -> dict[str, Any]:
     """Опции yt-dlp: видео (mp4 + качество) или только звук (mp3)."""
     opts: dict[str, Any] = {
@@ -567,6 +592,12 @@ def _ydl_opts(
         q = _normalize_quality(quality)
         opts["format"] = FORMAT_BY_QUALITY.get(q, FORMAT_BY_QUALITY[QUALITY_BEST])
         opts["merge_output_format"] = "mp4"
+
+    if player_clients:
+        # Значения extractor_args — всегда списки строк.
+        # continuedl выключен: оборванный первый файл нельзя докачивать другим клиентом.
+        opts["extractor_args"] = {"youtube": {"player_client": list(player_clients)}}
+        opts["continuedl"] = False
 
     return opts
 
@@ -659,6 +690,7 @@ def _do_download(
             *,
             use_file: Path | None,
             use_browser: str | None,
+            player_clients: list[str] | None = None,
         ) -> tuple[Any, Path]:
             opts = _ydl_opts(
                 out_dir,
@@ -666,6 +698,7 @@ def _do_download(
                 quality,
                 cookies_file=use_file,
                 cookies_browser=use_browser,
+                player_clients=player_clients,
             )
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -675,8 +708,30 @@ def _do_download(
         try:
             info, path = _run(use_file=cookies_file, use_browser=browser)
         except Exception as first_exc:  # noqa: BLE001
+            # YouTube: страница открытая, а файл по обычной ссылке CDN режет 403.
+            # Клиент android отдаёт цельный mp4 (часто 360p) без этого отказа.
+            if _is_youtube_url(url) and _youtube_cdn_blocked(first_exc):
+                with _lock:
+                    _state["warning"] = (
+                        (warning + " " if warning else "")
+                        + "YouTube не отдал полное качество, беру запасной файл…"
+                    ).strip()
+                info, path = _run(
+                    use_file=cookies_file,
+                    use_browser=browser,
+                    player_clients=["android"],
+                )
+                height = int((info or {}).get("height") or 0)
+                note = (
+                    f"Файл скачан в {height}p: более высокое качество YouTube сейчас не отдаёт."
+                    if height
+                    else "Файл скачан в запасном качестве: более высокое YouTube сейчас не отдаёт."
+                )
+                warning = f"{warning} {note}".strip() if warning else note
+                with _lock:
+                    _state["warning"] = warning
             # ВК: закрытое видео — один авто-повтор с cookies браузера (Edge→Chrome→Firefox)
-            if (
+            elif (
                 _is_vk_url(url)
                 and _needs_auth_retry(first_exc)
                 and cookies_file is None
