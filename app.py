@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import yt_dlp
 from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 import page_videos
 from fastapi.responses import FileResponse
@@ -209,8 +210,17 @@ _VK_HOST_RE = re.compile(
 )
 
 app = FastAPI(title="Качалка")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"(chrome-extension|extension)://.+",
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 _lock = threading.Lock()
+_pending: list[dict[str, Any]] = []
+_MAX_BATCH = 12
+_MAX_QUEUE = 24
 _state: dict[str, Any] = {
     "status": "idle",  # idle | downloading | done | error
     "percent": 0.0,
@@ -223,6 +233,8 @@ _state: dict[str, Any] = {
     "warning": "",
     "mode": MODE_VIDEO,
     "quality": QUALITY_BEST,
+    "queued": 0,
+    "queue_note": "",
 }
 
 
@@ -775,12 +787,96 @@ def _do_download(
             _state["quality"] = quality
             if path.exists():
                 _state["size"] = _format_bytes(path.stat().st_size)
+            _state["queued"] = len(_pending)
     except Exception as exc:  # noqa: BLE001 — показываем ошибку на странице, сервер жив
         with _lock:
             _state["status"] = "error"
             _state["error"] = _human_error(exc, url=url)
             _state["speed"] = ""
             _state["percent"] = 0.0
+            _state["queued"] = len(_pending)
+            if _pending:
+                _state["queue_note"] = _state["error"]
+    finally:
+        _pump_queue()
+
+
+def _pump_queue() -> None:
+    """Запустить следующий ролик из очереди, если сейчас никто не качается."""
+    with _lock:
+        if _state["status"] == "downloading" or not _pending:
+            _state["queued"] = len(_pending)
+            return
+        item = _pending.pop(0)
+        _state["queued"] = len(_pending)
+        _state["status"] = "downloading"
+        _state["percent"] = 0.0
+        _state["speed"] = ""
+        _state["size"] = ""
+        _state["error"] = ""
+        _state["title"] = ""
+        _state["filename"] = ""
+    threading.Thread(
+        target=_do_download,
+        args=(
+            item["url"],
+            item["folder"],
+            item["mode"],
+            item["quality"],
+            item["cookies_browser"],
+        ),
+        daemon=True,
+    ).start()
+
+
+def _enqueue_downloads(
+    urls: list[str],
+    folder: str | None,
+    mode: str,
+    quality: str,
+    cookies_browser: str | None,
+) -> dict[str, Any]:
+    """Поставить ролики в очередь. Первый стартует сразу, если загрузка свободна."""
+    clean: list[str] = []
+    seen: set[str] = set()
+    with _lock:
+        already = {str(item.get("url") or "") for item in _pending}
+    for raw in list(urls)[:_MAX_BATCH]:
+        url = _normalize_url(str(raw or ""))
+        if not url.startswith("http") or url in seen or url in already:
+            continue
+        seen.add(url)
+        clean.append(url)
+    if not clean:
+        return {"ok": False, "error": "Не выбрано ни одного ролика"}
+    with _lock:
+        room = _MAX_QUEUE - len(_pending)
+        if room <= 0:
+            return {
+                "ok": False,
+                "error": "Очередь занята — дождись, пока скачается текущее",
+            }
+        accepted = clean[:room]
+        if _state["status"] != "downloading":
+            _state["queue_note"] = ""
+        for url in accepted:
+            _pending.append(
+                {
+                    "url": url,
+                    "folder": folder,
+                    "mode": mode,
+                    "quality": quality,
+                    "cookies_browser": cookies_browser,
+                }
+            )
+        _state["queued"] = len(_pending)
+    _pump_queue()
+    with _lock:
+        return {
+            "ok": True,
+            "accepted": len(accepted),
+            "queued": int(_state.get("queued") or 0),
+        }
 
 
 class DownloadRequest(BaseModel):
@@ -794,6 +890,14 @@ class DownloadRequest(BaseModel):
 
 class InspectRequest(BaseModel):
     url: str
+
+
+class DownloadManyRequest(BaseModel):
+    urls: list[str]
+    folder: str | None = None
+    mode: str | None = MODE_VIDEO
+    quality: str | None = QUALITY_BEST
+    cookies_browser: str | None = None
 
 
 def _present_found(videos: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -1012,6 +1116,7 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
                 "warning": warning,
                 "mode": mode,
                 "quality": quality,
+                "queue_note": "",
             }
         )
     thread = threading.Thread(
@@ -1032,6 +1137,25 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
     }
 
 
+@app.post("/api/download-many")
+def download_many(req: DownloadManyRequest) -> dict[str, Any]:
+    """Очередь из расширения: несколько роликов качаются друг за другом."""
+    mode = _normalize_mode(req.mode)
+    quality = _normalize_quality(req.quality)
+    cookies_browser = _normalize_browser(req.cookies_browser)
+    folder = (req.folder or "").strip() or None
+    if folder is None:
+        with _lock:
+            folder = str(_state.get("out_dir") or "") or None
+    return _enqueue_downloads(
+        list(req.urls or []),
+        folder,
+        mode,
+        quality,
+        cookies_browser,
+    )
+
+
 @app.get("/api/status")
 def get_status() -> dict[str, Any]:
     with _lock:
@@ -1043,6 +1167,7 @@ def reset_status() -> dict[str, Any]:
     with _lock:
         if _state["status"] == "downloading":
             return {"ok": False, "error": "Скачивание ещё идёт"}
+        _pending.clear()
         out_dir = _state.get("out_dir") or str(DEFAULT_OUT)
         _state.update(
             {
@@ -1055,6 +1180,8 @@ def reset_status() -> dict[str, Any]:
                 "error": "",
                 "out_dir": out_dir,
                 "warning": "",
+                "queued": 0,
+                "queue_note": "",
             }
         )
     return {"ok": True}

@@ -774,14 +774,25 @@
         if (s.mode === "audio") modeHint = " (mp3)";
         else if (s.quality === "720") modeHint = " (до 720p)";
         else if (s.quality === "480") modeHint = " (до 480p)";
+        const queueCount = Number(s.queued) || 0;
         statusLine.textContent = s.title
           ? "Скачиваю" + modeHint + ": " + s.title
           : "Скачиваю" + modeHint + "…";
+        if (queueCount > 0) {
+          statusLine.textContent += " · ещё " + queueCount + " в очереди";
+        }
         const hintParts = [];
         if (activeEmbedHint) hintParts.push(activeEmbedHint);
         if (s.warning) hintParts.push(s.warning);
+        if (s.queue_note) hintParts.push(s.queue_note);
         setWarn(progressWarn, hintParts.join(" "));
         if (s.out_dir) updateFooter(s.out_dir);
+      } else if ((s.status === "done" || s.status === "error") && (Number(s.queued) || 0) > 0) {
+        showOnly("progress");
+        statusLine.textContent = s.status === "error"
+          ? "Этот ролик не скачался. В очереди ещё " + s.queued
+          : "В очереди ещё " + s.queued;
+        if (s.queue_note) setWarn(progressWarn, s.queue_note);
       } else if (s.status === "done") {
         stopPoll();
         showOnly("done");
@@ -791,7 +802,7 @@
           ? s.filename + (s.size ? " · " + s.size : "")
           : s.size || "";
         doneFolder.textContent = s.out_dir ? "Папка: " + s.out_dir : "";
-        setWarn(doneWarn, s.warning || "");
+        setWarn(doneWarn, [s.warning, s.queue_note].filter(Boolean).join(" "));
         if (s.out_dir) {
           folderInput.value = s.out_dir;
           saveFolderLocal(s.out_dir);

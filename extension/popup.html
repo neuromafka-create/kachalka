@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Качалка</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <h1>Качалка</h1>
+    <p id="lead">Ролики на открытой странице</p>
+  </header>
+  <p id="banner" class="banner hidden"></p>
+  <div id="tools" class="tools hidden">
+    <button type="button" id="toggle-all">Отметить все</button>
+  </div>
+  <div id="list"></div>
+  <p id="empty" class="empty hidden"></p>
+  <button type="button" id="download" disabled>Скачать выбранные</button>
+  <p id="status" class="status"></p>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -10,6 +10,7 @@ root = Path(SPECPATH)
 datas = [
     (str(root / "static"), "static"),
     (str(root / "pick_folder.py"), "."),
+    (str(root / "extension"), "extension"),
 ]
 # ffmpeg, если уже скачан install.bat
 ffmpeg_bin = root / "ffmpeg" / "bin"
