@@ -50,8 +50,41 @@ const home = scan.collectVideos({
   title: "YouTube",
   iframes: [],
   videos: [],
+  links: [{ href: "https://www.youtube.com/watch?v=zzzzzzzzzzz", title: "Рекомендация" }],
+  textUrls: ["https://www.youtube.com/watch?v=yyyyyyyyyyy"],
 });
 assert.deepStrictEqual(home, []);
+
+const watchKeepsPage = scan.collectVideos({
+  href: yt,
+  title: "Ролик - YouTube",
+  links: [{ href: "https://www.youtube.com/watch?v=zzzzzzzzzzz", title: "Рядом" }],
+  textUrls: ["https://www.youtube.com/watch?v=yyyyyyyyyyy"],
+});
+assert.strictEqual(watchKeepsPage.length, 1);
+assert.strictEqual(watchKeepsPage[0].url, yt);
+
+const fromLink = scan.collectVideos({
+  href: "https://example.com/post",
+  title: "Подборка",
+  links: [
+    { href: "https://www.youtube.com/watch?v=abcdefghijk", title: "Лекция" },
+    { href: "https://example.com/about", title: "О сайте" },
+  ],
+  textUrls: ["https://rutube.ru/video/deadbeef12/"],
+});
+assert.deepStrictEqual(fromLink.map((item) => item.url), [
+  "https://www.youtube.com/watch?v=abcdefghijk",
+  "https://rutube.ru/video/deadbeef12/",
+]);
+assert.strictEqual(fromLink[0].title, "Лекция");
+
+const vkPage = scan.collectVideos({
+  href: "https://vk.com/video-1_2",
+  title: "Клип",
+});
+assert.strictEqual(vkPage.length, 1);
+assert.strictEqual(vkPage[0].url, "https://vk.ru/video-1_2");
 
 const meta = scan.collectVideos({
   href: "https://news.example/story",
@@ -61,5 +94,23 @@ const meta = scan.collectVideos({
 assert.strictEqual(meta.length, 1);
 assert.strictEqual(meta[0].url, "https://www.youtube.com/watch?v=zzzzzzzzzzz");
 assert.strictEqual(meta[0].title, "Сюжет дня");
+
+const gcPayload = Buffer.from(
+  '{"video_hash":"e0d48990424815b4cca708573e6510bf","user_id":-1}',
+).toString("base64");
+const gcPlayer =
+  "https://vh-api-1-de.gceuproxy.com/sign-player/?json=" + gcPayload + "&s=abc123";
+const gcCopy = gcPlayer.replace("s=abc123", "s=def456");
+const gc = scan.collectVideos({
+  href: "https://vasilinfo.ru/vkshopszap",
+  title: "",
+  iframes: [
+    { src: gcPlayer, title: "" },
+    { src: gcCopy, title: "" },
+  ],
+});
+assert.strictEqual(gc.length, 1);
+assert.strictEqual(gc[0].url, gcPlayer);
+assert.strictEqual(gc[0].title, "GetCourse");
 
 console.log("extension scan ok");

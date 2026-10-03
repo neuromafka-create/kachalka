@@ -143,7 +143,35 @@
     if (hostIs(host, "dzen.ru")) return /\/(?:embed|video\/watch|shorts)\/[\w.-]+/.test(path);
     if (hostIs(host, "tiktok.com")) return path.indexOf("/video/") !== -1;
     if (hostIs(host, "twitch.tv")) return host.startsWith("player.") || path.indexOf("/videos/") !== -1;
+    if (/\/sign-player\/?$/.test(path) && /[?&]json=/.test(parsed.search || "")) return true;
     return false;
+  }
+
+  function getcourseHash(url) {
+    try {
+      const parsed = new URL(url);
+      if (!/\/sign-player\/?$/.test(parsed.pathname || "")) return "";
+      const raw = parsed.searchParams.get("json") || "";
+      if (!raw) return "";
+      const body = raw.replace(/-/g, "+").replace(/_/g, "/");
+      const pad = body + "=".repeat((4 - (body.length % 4)) % 4);
+      const payload = JSON.parse(atob(pad));
+      const hash = payload && payload.video_hash;
+      return /^[0-9a-f]{16,64}$/i.test(hash) ? String(hash).toLowerCase() : "";
+    } catch (_err) {
+      return "";
+    }
+  }
+
+  function knownVideoSite(url) {
+    const host = hostOf(url);
+    return host === "youtu.be" || host.endsWith(".youtu.be")
+      || hostIs(host, "youtube.com") || hostIs(host, "youtube-nocookie.com")
+      || hostIs(host, "vk.com") || hostIs(host, "vk.ru") || hostIs(host, "vkvideo.ru")
+      || hostIs(host, "rutube.ru") || hostIs(host, "vimeo.com")
+      || hostIs(host, "dzen.ru") || hostIs(host, "ok.ru")
+      || hostIs(host, "tiktok.com") || hostIs(host, "twitch.tv")
+      || hostIs(host, "dailymotion.com") || host === "dai.ly";
   }
 
   function canonicalKey(url) {
@@ -187,6 +215,8 @@
       const found = path.match(/\/(?:videoembed|video|live)\/(\d+)/);
       if (found) return "ok:" + found[1] + secret;
     }
+    const gc = getcourseHash(url);
+    if (gc) return "gc:" + gc;
     if (mediaExt(path)) return "file:" + host + path;
     return url.split("#")[0];
   }
@@ -216,6 +246,7 @@
     if (hostIs(host, "dzen.ru")) return "Дзен";
     if (hostIs(host, "twitch.tv")) return "Twitch";
     if (hostIs(host, "tiktok.com")) return "TikTok";
+    if (/\/sign-player\/?$/.test(new URL(url).pathname || "")) return "GetCourse";
     if (mediaExt(host ? new URL(url).pathname : "")) return "Файл на странице";
     return host || "Видео";
   }
@@ -274,6 +305,23 @@
         const src = absUrl(raw, href);
         if (!src || !isVideoUrl(src)) return;
         pushItem(found, src, pageTitle, "meta");
+      });
+    }
+
+    // Ссылки из вёрстки — только на обычной странице и только если плеера нет.
+    // На YouTube, ВК и Rutube лента рекомендаций в список не попадает.
+    if (!found.length && !knownVideoSite(href)) {
+      (page && page.links || []).forEach(function (link) {
+        const raw = typeof link === "string" ? link : (link && (link.href || link.url));
+        const title = typeof link === "string" ? "" : (link && link.title) || "";
+        const src = absUrl(raw, href);
+        if (!src) return;
+        pushItem(found, src, title, "link");
+      });
+      (page && page.textUrls || []).forEach(function (raw) {
+        const src = absUrl(raw, href);
+        if (!src) return;
+        pushItem(found, src, "", "text");
       });
     }
 

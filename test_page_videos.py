@@ -121,6 +121,46 @@ class FindEmbeddedTests(unittest.TestCase):
         html = '<audio><source src="/a.mp3" type="audio/mpeg"/></audio>'
         self.assertEqual(_urls(html), [])
 
+    def test_getcourse_player_keeps_signature_and_collapses_copies(self) -> None:
+        import base64
+
+        payload = base64.b64encode(
+            b'{"video_hash":"e0d48990424815b4cca708573e6510bf","user_id":-1}'
+        ).decode("ascii")
+        first = (
+            "https://vh-api-1-de.gceuproxy.com/sign-player/"
+            f"?json={payload}&s=abc123"
+        )
+        second = first.replace("s=abc123", "s=def456")
+        html = (
+            f'<iframe src="{first}"></iframe>'
+            f'<div data-iframe-src="{second}"></div>'
+        )
+        found = pv.find_embedded_videos(html, "https://vasilinfo.ru/vkshopszap")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["url"], first)
+        self.assertEqual(found[0]["title"], "GetCourse")
+        self.assertIn("s=abc123", found[0]["url"])
+
+    def test_getcourse_host_without_player_is_not_a_video(self) -> None:
+        html = '<a href="https://vh-api-1-de.gceuproxy.com/health">cdn</a>'
+        self.assertEqual(_urls(html), [])
+
+
+class GetCourseExtractorTests(unittest.TestCase):
+    def test_ytdlp_accepts_gceuproxy_player(self) -> None:
+        import app  # noqa: F401  — патч плеера при импорте
+        from yt_dlp.extractor.lazy_extractors import GetCourseRuPlayerIE
+
+        player = (
+            "https://vh-api-1-de.gceuproxy.com/sign-player/"
+            "?json=eyJ2aWRlb19oYXNoIjoiZTBkNDg5OTA0MjQ4MTViNGNjYTcwODU3M2U2NTEwYmYifQ&s=abc"
+        )
+        classic = "http://player02.getcourse.ru/sign-player/?json=eyJ2aWRlb19oYXNoIjoiYWJjIn0&s=1"
+        self.assertTrue(GetCourseRuPlayerIE.suitable(player))
+        self.assertTrue(GetCourseRuPlayerIE.suitable(classic))
+        self.assertFalse(GetCourseRuPlayerIE.suitable("https://vasilinfo.ru/vkshopszap"))
+
 
 class DirectUrlTests(unittest.TestCase):
     def test_known_video_links(self) -> None:

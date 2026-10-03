@@ -114,6 +114,36 @@ def _patch_yt_dlp_vk_prefer_ru() -> None:
 
 _patch_yt_dlp_vk_prefer_ru()
 
+# Плеер GetCourse в yt-dlp 2026.07.04 узнаётся только на player02.getcourse.ru
+# и cf-api-2.vhcdn.com. Школы на своём домене отдают vh-api-*.gceuproxy.com.
+_GETCOURSE_PLAYER_URL_RE = (
+    r"https?://[^/?#\s]+/sign-player/?(?:\?|/)(?:[^#\s]*&)?json=[^#&\s]+"
+)
+
+
+def _patch_yt_dlp_getcourse_player() -> None:
+    """Расширить адрес плеера GetCourse, не трогая сам разбор плейлиста."""
+    try:
+        from yt_dlp.extractor.getcourseru import GetCourseRuPlayerIE
+        from yt_dlp.extractor.lazy_extractors import (
+            GetCourseRuPlayerIE as LazyGetCourseRuPlayerIE,
+        )
+    except ImportError:
+        return
+    if getattr(GetCourseRuPlayerIE, "_kachalka_broad_player", False):
+        return
+    for cls in (GetCourseRuPlayerIE, LazyGetCourseRuPlayerIE):
+        cls._VALID_URL = _GETCOURSE_PLAYER_URL_RE
+        if "_VALID_URL_RE" in cls.__dict__:
+            delattr(cls, "_VALID_URL_RE")
+    GetCourseRuPlayerIE._EMBED_REGEX = [
+        rf'<iframe[^>]+\bsrc=[\'"](?P<url>{_GETCOURSE_PLAYER_URL_RE}[^\'"]*)'
+    ]
+    GetCourseRuPlayerIE._kachalka_broad_player = True
+
+
+_patch_yt_dlp_getcourse_player()
+
 
 def _app_dir() -> Path:
     """Папка приложения: рядом с .exe (сборка) или с исходниками (разработка).

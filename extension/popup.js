@@ -10,9 +10,12 @@ const leadEl = document.getElementById("lead");
 let server = null;
 let videos = [];
 
-function collectInPage() {
-  const scan = globalThis.KachalkaScan;
-  if (!scan) return [];
+function snapshotInPage() {
+  const iframes = [];
+  const videos = [];
+  const metas = [];
+  const links = [];
+  const seen = new Set();
 
   function jsonLdUrls() {
     const out = [];
@@ -46,40 +49,82 @@ function collectInPage() {
     return out;
   }
 
-  const videosOnPage = Array.prototype.map.call(document.querySelectorAll("video"), function (el) {
-    return {
-      currentSrc: el.currentSrc || "",
-      src: el.src || "",
-      title: el.getAttribute("title") || el.getAttribute("aria-label") || "",
-      duration: Number.isFinite(el.duration) ? el.duration : 0,
-      sources: Array.prototype.map.call(el.querySelectorAll("source"), function (source) {
+  function consider(el) {
+    if (!el || !el.tagName) return;
+    const tag = el.tagName;
+    if (tag === "IFRAME" && iframes.length < 40) {
+      const src = el.src || el.getAttribute("data-src") || el.getAttribute("data-lazy-src") || el.getAttribute("data-iframe-src") || "";
+      const key = "i:" + src;
+      if (!src || seen.has(key)) return;
+      seen.add(key);
+      iframes.push({
+        src: src,
+        title: el.getAttribute("title") || el.getAttribute("aria-label") || "",
+      });
+    } else if (tag === "VIDEO" && videos.length < 40) {
+      const sources = Array.prototype.map.call(el.querySelectorAll("source"), function (source) {
         return source.src || source.getAttribute("src") || "";
-      }),
-    };
-  });
-  const iframes = Array.prototype.map.call(document.querySelectorAll("iframe"), function (el) {
-    return {
-      src: el.src || "",
-      dataSrc: el.getAttribute("data-src") || el.getAttribute("data-lazy-src") || "",
-      title: el.getAttribute("title") || el.getAttribute("aria-label") || "",
-    };
-  });
-  const metas = Array.prototype.map.call(
-    document.querySelectorAll(
-      'meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"]'
-    ),
-    function (el) {
-      return el.content || "";
+      });
+      videos.push({
+        currentSrc: el.currentSrc || "",
+        src: el.src || "",
+        title: el.getAttribute("title") || el.getAttribute("aria-label") || "",
+        duration: Number.isFinite(el.duration) ? el.duration : 0,
+        sources: sources,
+      });
+    } else if (tag === "META" && metas.length < 10) {
+      const prop = (el.getAttribute("property") || el.getAttribute("name") || "").toLowerCase();
+      if (prop.indexOf("og:video") === 0 && el.content) metas.push(el.content);
+    } else if (tag === "A" && links.length < 30) {
+      const href = el.href || "";
+      if (href.indexOf("http") !== 0 || seen.has("a:" + href)) return;
+      seen.add("a:" + href);
+      links.push({ href: href, title: (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 140) });
     }
-  );
-  return scan.collectVideos({
-    href: location.href,
+    if (tag !== "IFRAME" && iframes.length < 40) {
+      const lazy = el.getAttribute("data-iframe-src") || "";
+      const key = "i:" + lazy;
+      if (!lazy || seen.has(key)) return;
+      seen.add(key);
+      iframes.push({ src: lazy, title: el.getAttribute("title") || "" });
+    }
+  }
+
+  function walk(root, depth) {
+    if (!root || !root.querySelectorAll || depth > 5) return;
+    const nodes = root.querySelectorAll("iframe, video, meta[property], meta[name], a[href], [data-iframe-src]");
+    for (let i = 0; i < nodes.length; i += 1) consider(nodes[i]);
+    const hosts = root.querySelectorAll("*");
+    const limit = Math.min(hosts.length, 6000);
+    for (let i = 0; i < limit; i += 1) {
+      if (hosts[i].shadowRoot) walk(hosts[i].shadowRoot, depth + 1);
+    }
+  }
+
+  walk(document, 0);
+
+  let textUrls = [];
+  const href = location.href || "";
+  const direct = /youtube\.com\/watch|youtu\.be\/|youtube\.com\/shorts|youtube\.com\/embed|\/video|rutube\.|vimeo\.|vk\.com\/video|vk\.ru\/video|vkvideo\.ru/i.test(href);
+  if (!direct && document.documentElement) {
+    const html = document.documentElement.innerHTML.slice(0, 350000);
+    const re = /https?:\/\/[^\s"'<>]{10,1200}/gi;
+    let match;
+    while ((match = re.exec(html)) && textUrls.length < 30) {
+      textUrls.push(match[0].replace(/[),.;]+$/, ""));
+    }
+  }
+
+  return {
+    href: href,
     title: document.title || "",
-    videos: videosOnPage,
+    videos: videos,
     iframes: iframes,
     metas: metas,
+    links: links,
+    textUrls: textUrls,
     jsonLd: jsonLdUrls(),
-  });
+  };
 }
 
 function videosWord(count) {
@@ -115,7 +160,7 @@ function renderList() {
   listEl.textContent = "";
   if (!videos.length) {
     emptyEl.textContent =
-      "На этой странице не вижу роликов. Если плеер ещё не открыт, включи его и нажми на значок ещё раз.";
+      "На этой вкладке ролика не видно. Открой сам ролик или страницу, где он встроен, и нажми значок ещё раз. Страница расширений браузера сюда не подходит.";
     emptyEl.classList.remove("hidden");
     toolsEl.classList.add("hidden");
     refreshDownloadButton();
@@ -178,15 +223,38 @@ async function videosFromTab() {
   if (/^(chrome|edge|about|browser|devtools|view-source):/i.test(url)) {
     throw new Error("Эту служебную страницу браузер не даёт читать");
   }
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    files: ["scan.js"],
-  });
-  const [injected] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: collectInPage,
-  });
-  return (injected && injected.result) || [];
+  const snapshot = {
+    href: url,
+    title: tab.title || "",
+    iframes: [],
+    videos: [],
+    metas: [],
+    links: [],
+    textUrls: [],
+    jsonLd: [],
+  };
+  if (tab.id !== undefined && !/^(chrome|edge|about|browser|devtools|view-source):/i.test(url)) {
+    try {
+      const [injected] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: snapshotInPage,
+      });
+      if (injected && injected.result) {
+        const got = injected.result;
+        snapshot.href = got.href || snapshot.href;
+        snapshot.title = got.title || snapshot.title;
+        snapshot.iframes = got.iframes || [];
+        snapshot.videos = got.videos || [];
+        snapshot.metas = got.metas || [];
+        snapshot.links = got.links || [];
+        snapshot.textUrls = got.textUrls || [];
+        snapshot.jsonLd = got.jsonLd || [];
+      }
+    } catch (err) {
+      if (!globalThis.KachalkaScan.isVideoUrl(snapshot.href)) throw err;
+    }
+  }
+  return globalThis.KachalkaScan.collectVideos(snapshot);
 }
 
 async function init() {

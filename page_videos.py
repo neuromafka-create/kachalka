@@ -3,6 +3,7 @@
 # Прямую ссылку на YouTube/VK не трогает — её и так понимает yt-dlp.
 from __future__ import annotations
 
+import base64
 import json
 import re
 from html import unescape
@@ -101,6 +102,11 @@ _EMBED_RES = (
     re.compile(r"https?://(?:www\.)?dailymotion\.com/embed/video/[\w]+", re.I),
     re.compile(r"https?://(?:www\.)?dzen\.ru/embed/[\w.-]+", re.I),
     re.compile(r"https?://player\.twitch\.tv/\?[^\"'\s<>]{0,400}", re.I),
+    # Плеер GetCourse: школы часто сидят на своём домене, а ролик — на sign-player.
+    re.compile(
+        r"https?://[^\"'\s<>]+/sign-player/\?(?:[^\"'\s<>]*&)?json=[^\"'\s<>]+",
+        re.I,
+    ),
     re.compile(
         r"https?://[^\"'\s<>]+?\.(?:mp4|webm|mkv|mov|m4v|ogv|m3u8|mpd)"
         r"(?:\?[^\"'\s<>]{0,400})?",
@@ -154,6 +160,40 @@ def _has_secret(url: str) -> bool:
     return bool(_secret_suffix(urlparse(url).query))
 
 
+def _getcourse_player(url: str) -> bool:
+    """Подписанный плеер GetCourse. Сам json= обязателен, иначе это не ролик."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    path = (parsed.path or "").rstrip("/")
+    if not path.endswith("/sign-player"):
+        return False
+    return "json=" in (parsed.query or "").lower()
+
+
+def _getcourse_hash(url: str) -> str:
+    """video_hash из json=, чтобы один ролик с двумя подписями не двоился."""
+    if not _getcourse_player(url):
+        return ""
+    # parse_qs превращает «+» из base64 в пробел и ломает video_hash.
+    found = re.search(r"(?:^|&)json=([^&]*)", urlparse(url).query)
+    raw = unquote(found.group(1)).strip() if found else ""
+    if not raw:
+        return ""
+    padded = raw + "=" * ((4 - len(raw) % 4) % 4)
+    try:
+        payload = json.loads(base64.b64decode(padded, validate=False))
+    except (ValueError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    video_hash = str(payload.get("video_hash") or "")
+    if re.fullmatch(r"[0-9a-fA-F]{16,64}", video_hash):
+        return video_hash.lower()
+    return ""
+
+
 def is_video_url(url: str) -> bool:
     """Ссылка уже указывает на ролик или файл, а не на статью."""
     try:
@@ -204,6 +244,8 @@ def is_video_url(url: str) -> bool:
         return "/video/" in path
     if host.endswith("twitch.tv"):
         return host.startswith("player.") or "/videos/" in path
+    if _getcourse_player(url):
+        return True
     return False
 
 
@@ -245,6 +287,9 @@ def canonical_key(url: str) -> str:
         found = re.search(r"/(?:videoembed|video|live)/(\d+)", path)
         if found:
             return "ok:" + found.group(1) + secret
+    video_hash = _getcourse_hash(url)
+    if video_hash:
+        return "gc:" + video_hash
     if _media_ext(path):
         return "file:" + host + path
     return url.split("#", 1)[0]
@@ -289,6 +334,8 @@ def service_name(url: str) -> str:
         return "Twitch"
     if host.endswith("tiktok.com"):
         return "TikTok"
+    if _getcourse_player(url):
+        return "GetCourse"
     if _media_ext(urlparse(url).path):
         return "Файл на странице"
     return host or "Видео"
@@ -391,7 +438,7 @@ class _PageParser(HTMLParser):
             return
         if name.endswith("iframe") or name in ("frame", "embed"):
             label = a.get("title") or ""
-            for key in ("src", "data-src", "data-lazy-src"):
+            for key in ("src", "data-src", "data-lazy-src", "data-iframe-src"):
                 if a.get(key):
                     self.collector.add(a[key], label, "iframe", self.page_url)
             return
@@ -418,6 +465,10 @@ class _PageParser(HTMLParser):
                 "iframe",
                 self.page_url,
             )
+        # GetCourse кладёт адрес плеера и в iframe, и в data-iframe-src блока.
+        lazy_player = a.get("data-iframe-src") or ""
+        if lazy_player:
+            self.collector.add(lazy_player, a.get("title") or "", "iframe", self.page_url)
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "script" and self._jsonld is not None:
