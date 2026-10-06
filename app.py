@@ -145,6 +145,93 @@ def _patch_yt_dlp_getcourse_player() -> None:
 _patch_yt_dlp_getcourse_player()
 
 
+def _yandex_user_data_dir() -> str:
+    """Профиль Яндекс.Браузера: обычное дерево Chromium, ключ DPAPI пользователя."""
+    local = os.environ.get("LOCALAPPDATA") or ""
+    return os.path.join(local, "Yandex", "YandexBrowser", "User Data")
+
+
+def _patch_yt_dlp_browser_cookies() -> None:
+    """Яндекс.Браузер в cookies-from-browser и пропуск cookies с префиксом v20.
+
+    v20 — это app-bound шифрование Chrome/Edge: другая программа его не читает.
+    Одна такая запись не должна обрывать весь список. Сам v20 не расшифровываем.
+    """
+    try:
+        import yt_dlp.cookies as cookies
+        from yt_dlp.utils import DownloadError
+    except ImportError:
+        return
+    if getattr(cookies, "_kachalka_browser_cookies", False):
+        return
+
+    cookies.CHROMIUM_BASED_BROWSERS.add("yandex")
+    cookies.SUPPORTED_BROWSERS.add("yandex")
+
+    orig_settings = cookies._get_chromium_based_browser_settings
+
+    def _settings(browser_name: str):
+        if browser_name == "yandex" and sys.platform in ("win32", "cygwin"):
+            return {
+                "browser_dir": _yandex_user_data_dir(),
+                "keyring_name": "Yandex",
+                "supports_profiles": True,
+            }
+        return orig_settings(browser_name)
+
+    cookies._get_chromium_based_browser_settings = _settings
+
+    orig_decrypt = cookies.WindowsChromeCookieDecryptor.decrypt
+
+    def _decrypt(self, encrypted_value):  # noqa: ANN001
+        prefix = encrypted_value[:3] if encrypted_value else b""
+        if prefix == b"v20":
+            self._cookie_counts["v20"] = self._cookie_counts.get("v20", 0) + 1
+            cookies._kachalka_skipped_v20 = getattr(cookies, "_kachalka_skipped_v20", 0) + 1
+            return None
+        return orig_decrypt(self, encrypted_value)
+
+    cookies.WindowsChromeCookieDecryptor.decrypt = _decrypt
+
+    orig_extract = cookies.extract_cookies_from_browser
+
+    def _extract(
+        browser_name,
+        profile=None,
+        logger=cookies.YDLLogger(),
+        *,
+        keyring=None,
+        container=None,
+    ):
+        cookies._kachalka_skipped_v20 = 0
+        try:
+            jar = orig_extract(
+                browser_name,
+                profile,
+                logger,
+                keyring=keyring,
+                container=container,
+            )
+        except DownloadError as exc:
+            low = str(exc).lower()
+            if "could not copy" in low and "cookie" in low:
+                raise DownloadError(
+                    f"could not copy {browser_name} cookie database"
+                ) from exc
+            raise
+        if cookies._kachalka_skipped_v20 and not any(True for _ in jar):
+            raise DownloadError(
+                f"{browser_name} cookies are app-bound (v20) and were not shared"
+            )
+        return jar
+
+    cookies.extract_cookies_from_browser = _extract
+    cookies._kachalka_browser_cookies = True
+
+
+_patch_yt_dlp_browser_cookies()
+
+
 def _app_dir() -> Path:
     """Папка приложения: рядом с .exe (сборка) или с исходниками (разработка).
     Сюда пишем «Скачанное» — должна быть доступна на запись.
@@ -209,8 +296,20 @@ FORMAT_BY_QUALITY: dict[str, str] = {
 MODE_VIDEO = "video"
 MODE_AUDIO = "audio"
 
-# Браузеры для cookies-from-browser (yt-dlp)
-BROWSER_CHOICES = ("chrome", "edge", "firefox", "opera", "brave", "chromium")
+# Браузеры для cookies-from-browser (yt-dlp). Яндекс — первый: его cookies
+# читаются ключом пользователя. Chrome и Edge отдают только v20.
+BROWSER_CHOICES = ("yandex", "chrome", "edge", "firefox", "opera", "brave", "chromium")
+BROWSER_TITLES = {
+    "yandex": "Яндекс.Браузер",
+    "chrome": "Chrome",
+    "edge": "Edge",
+    "firefox": "Firefox",
+    "opera": "Opera",
+    "brave": "Brave",
+    "chromium": "Chromium",
+}
+# Автоповтор закрытого ВК. Chrome и Edge здесь бесполезны: все их cookies — v20.
+VK_COOKIE_RETRY = ("yandex", "firefox", "opera", "brave")
 # Имена файла cookies (Netscape) рядом с exe / в «Скачанное»
 COOKIES_FILE_NAMES = (
     "cookies.txt",
@@ -405,9 +504,32 @@ def _normalize_browser(browser: str | None) -> str | None:
     return None
 
 
+def _browser_title(browser: str | None) -> str:
+    if not browser:
+        return ""
+    return BROWSER_TITLES.get(browser, browser)
+
+
+def _exc_search_text(exc: BaseException) -> str:
+    """Текст исключения вместе с причиной: yt-dlp прячет её в __context__."""
+    parts = [str(exc)]
+    seen = {id(exc)}
+    current: BaseException | None = exc
+    for _ in range(4):
+        if current is None:
+            break
+        nxt = current.__cause__ or current.__context__
+        if nxt is None or id(nxt) in seen:
+            break
+        seen.add(id(nxt))
+        parts.append(str(nxt))
+        current = nxt
+    return "\n".join(parts)
+
+
 def _human_error(exc: BaseException, *, url: str = "") -> str:
     msg = str(exc).strip()
-    low = msg.lower()
+    low = _exc_search_text(exc).lower()
     vk = (
         _is_vk_url(url)
         or "[vk]" in low
@@ -418,11 +540,46 @@ def _human_error(exc: BaseException, *, url: str = "") -> str:
 
     if "unsupported url" in low or "no suitable extractor" in low:
         return "Ссылка не открылась — такой сайт не поддерживается"
-    if "failed to decrypt with dpapi" in low or "could not copy" in low and "cookie" in low:
+    if "could not copy" in low and "cookie" in low:
+        if "could not copy yandex cookie" in low:
+            return (
+                "Яндекс.Браузер держит файл cookies. "
+                "Закрой его полностью, в том числе значок в трее, и попробуй снова."
+            )
         return (
-            "Не удалось прочитать cookies браузера (Windows DPAPI). "
-            "Закрой браузер и попробуй снова, либо положи cookies.txt "
-            "рядом с Качалкой (экспорт расширением «Get cookies.txt LOCALLY»)"
+            "Браузер держит файл cookies. "
+            "Закрой его полностью, в том числе значок в трее, и попробуй снова."
+        )
+    if "app-bound" in low or "(v20)" in low:
+        if "yandex cookies are app-bound" in low:
+            return (
+                "Яндекс.Браузер не отдал cookies этой программе. "
+                "Положи cookies.txt рядом с Качалкой "
+                "(экспорт расширением «Get cookies.txt LOCALLY»)."
+            )
+        return (
+            "Этот браузер не отдаёт cookies другим программам. "
+            "Войди в ВК в Яндекс.Браузере, закрой его полностью "
+            "и выбери «Войти через Яндекс.Браузер». "
+            "Либо положи cookies.txt рядом с Качалкой "
+            "(экспорт расширением «Get cookies.txt LOCALLY»)."
+        )
+    if "failed to decrypt with dpapi" in low:
+        return (
+            "Не удалось прочитать cookies браузера. "
+            "Закрой его полностью, в том числе значок в трее, и попробуй снова, "
+            "либо положи cookies.txt рядом с Качалкой "
+            "(экспорт расширением «Get cookies.txt LOCALLY»)."
+        )
+    if "could not find" in low and "cookie" in low:
+        if "yandex cookies database" in low:
+            return (
+                "Не нашла cookies Яндекс.Браузера. "
+                "Проверь, что он установлен и что ты в нём входила в ВК."
+            )
+        return (
+            "Не нашла cookies выбранного браузера. "
+            "Проверь, что он установлен и что ты в нём входила на сайт."
         )
     if (
         "private video" in low
@@ -435,7 +592,7 @@ def _human_error(exc: BaseException, *, url: str = "") -> str:
         if vk:
             return (
                 "ВК: видео закрыто или нужен вход. "
-                "Включи «cookies браузера» (будь в аккаунте ВК) "
+                "Выбери «Войти через Яндекс.Браузер» и закрой его перед скачиванием, "
                 "или положи cookies.txt рядом с Качалкой"
             )
         return "Видео недоступно — оно закрыто, ограничено по региону или требует входа"
@@ -670,6 +827,21 @@ def _final_path(ydl: yt_dlp.YoutubeDL, info: dict[str, Any], mode: str) -> Path:
     return prepared
 
 
+def _cookie_failure_rank(exc: BaseException) -> int:
+    """Какую ошибку cookies показать, если перебор браузеров не удался.
+
+    Закрытый файл Яндекс.Браузера важнее, чем «браузер не установлен».
+    """
+    low = _exc_search_text(exc).lower()
+    if "could not copy" in low and "cookie" in low:
+        return 3
+    if "app-bound" in low or "failed to decrypt with dpapi" in low:
+        return 2
+    if "could not find" in low and "cookie" in low:
+        return 0
+    return 1
+
+
 def _needs_auth_retry(exc: BaseException) -> bool:
     low = str(exc).lower()
     return any(
@@ -708,7 +880,7 @@ def _do_download(
             hint = f"Cookies: {cookies_file.name}"
             warning = f"{warning} {hint}".strip() if warning else hint
         elif browser:
-            hint = f"Cookies из браузера: {browser}"
+            hint = f"Cookies из браузера «{_browser_title(browser)}»"
             warning = f"{warning} {hint}".strip() if warning else hint
 
         with _lock:
@@ -772,34 +944,40 @@ def _do_download(
                 warning = f"{warning} {note}".strip() if warning else note
                 with _lock:
                     _state["warning"] = warning
-            # ВК: закрытое видео — один авто-повтор с cookies браузера (Edge→Chrome→Firefox)
+            # ВК: закрытое видео — авто-повтор с cookies. Сначала Яндекс.Браузер.
             elif (
                 _is_vk_url(url)
                 and _needs_auth_retry(first_exc)
                 and cookies_file is None
                 and browser is None
             ):
-                last_exc: BaseException = first_exc
-                for b in ("edge", "chrome", "firefox"):
+                best_exc: BaseException = first_exc
+                best_rank = _cookie_failure_rank(first_exc)
+                for b in VK_COOKIE_RETRY:
                     try:
                         with _lock:
                             _state["warning"] = (
                                 (warning + " " if warning else "")
-                                + f"Пробую cookies из {b}…"
+                                + f"Пробую браузер «{_browser_title(b)}»…"
                             ).strip()
                         info, path = _run(use_file=None, use_browser=b)
-                        last_exc = None  # type: ignore[assignment]
+                        best_exc = None  # type: ignore[assignment]
                         with _lock:
                             _state["warning"] = (
                                 (warning + " " if warning else "")
-                                + f"Вошёл через cookies {b}"
+                                + f"Вошёл через «{_browser_title(b)}»"
                             ).strip()
                         break
                     except Exception as retry_exc:  # noqa: BLE001
-                        last_exc = retry_exc
+                        rank = _cookie_failure_rank(retry_exc)
+                        if rank >= best_rank:
+                            best_exc = retry_exc
+                            best_rank = rank
                         continue
-                if last_exc is not None:
-                    raise last_exc from first_exc
+                if best_exc is not None:
+                    if best_exc is first_exc:
+                        raise best_exc
+                    raise best_exc from first_exc
             else:
                 raise
 
@@ -1127,7 +1305,7 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
         extra = f"Найден {cookies_file.name} — использую для входа"
         warning = f"{warning} {extra}".strip() if warning else extra
     elif cookies_browser:
-        extra = f"Буду брать cookies из {cookies_browser}"
+        extra = f"Буду брать cookies из браузера «{_browser_title(cookies_browser)}»"
         warning = f"{warning} {extra}".strip() if warning else extra
 
     # Статус до запуска потока: иначе первый опрос ещё видит idle

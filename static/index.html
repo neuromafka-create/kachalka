@@ -551,6 +551,7 @@
           </label>
           <select id="cookies-browser" aria-label="Cookies браузера">
             <option value="" selected>Не нужны (публичное видео)</option>
+            <option value="yandex">Войти через Яндекс.Браузер</option>
             <option value="edge">Войти через Edge</option>
             <option value="chrome">Войти через Chrome</option>
             <option value="firefox">Войти через Firefox</option>
@@ -558,7 +559,8 @@
             <option value="brave">Войти через Brave</option>
           </select>
           <p class="field-hint" id="cookies-hint">
-            Для закрытых роликов ВК: войди в аккаунт в браузере и выбери его здесь.
+            Для закрытых роликов ВК войди в аккаунт в Яндекс.Браузере и выбери его здесь.
+            Перед скачиванием закрой браузер полностью, вместе со значком в трее.
             Либо положи файл <code>cookies.txt</code> рядом с Качалкой.
           </p>
         </div>
@@ -664,6 +666,32 @@
 
     function currentCookiesBrowser() {
       return (cookiesSelect && cookiesSelect.value) || "";
+    }
+
+    let cookiesFileName = "";
+
+    function updateCookiesHint() {
+      if (!cookiesHint) return;
+      if (cookiesFileName) {
+        cookiesHint.innerHTML =
+          "Найден файл <code>" +
+          cookiesFileName +
+          "</code> — он будет использован для входа автоматически.";
+        return;
+      }
+      const v = currentCookiesBrowser();
+      if (v === "chrome" || v === "edge") {
+        cookiesHint.textContent =
+          "Chrome и Edge не отдают cookies другим программам. Войди в ВК в Яндекс.Браузере и выбери его, либо положи cookies.txt рядом с Качалкой.";
+        return;
+      }
+      if (v === "yandex") {
+        cookiesHint.textContent =
+          "Войди в ВК в Яндекс.Браузере. Перед скачиванием закрой его полностью, вместе со значком в трее.";
+        return;
+      }
+      cookiesHint.innerHTML =
+        "Для закрытых роликов ВК войди в аккаунт в браузере и выбери его здесь. Перед скачиванием закрой браузер полностью, вместе со значком в трее. Либо положи файл <code>cookies.txt</code> рядом с Качалкой.";
     }
 
     function setMode(mode) {
@@ -1059,6 +1087,7 @@
         try {
           localStorage.setItem(COOKIES_KEY, currentCookiesBrowser());
         } catch (_) {}
+        updateCookiesHint();
       });
     }
     urlInput.addEventListener("input", () => {
@@ -1095,7 +1124,6 @@
 
     // При открытии
     (async () => {
-      let cookiesFileName = "";
       try {
         const res = await fetch("/api/config");
         const cfg = await res.json();
@@ -1103,6 +1131,7 @@
         cookiesFileName = cfg.cookies_file_name || "";
       } catch (_) {
         defaultFolder = "";
+        cookiesFileName = "";
       }
 
       let saved = "";
@@ -1123,15 +1152,10 @@
         qualitySelect.value = "best";
       }
       if (cookiesSelect) {
-        const ok = ["", "edge", "chrome", "firefox", "opera", "brave", "chromium"];
+        const ok = ["", "yandex", "edge", "chrome", "firefox", "opera", "brave", "chromium"];
         cookiesSelect.value = ok.includes(savedCookies) ? savedCookies : "";
       }
-      if (cookiesHint && cookiesFileName) {
-        cookiesHint.innerHTML =
-          "Найден файл <code>" +
-          cookiesFileName +
-          "</code> — он будет использован для входа автоматически.";
-      }
+      updateCookiesHint();
       setMode(savedMode);
       updateFooter(folderInput.value);
 
