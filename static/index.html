@@ -546,6 +546,21 @@
         </div>
 
         <div class="field">
+          <label class="field-label" for="filename">Имя файла</label>
+          <input
+            id="filename"
+            type="text"
+            placeholder="Как назвать файл"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <p class="field-hint" id="filename-hint">
+            Качалка подставит имя с сайта. У Facebook из начала убираются просмотры и реакции —
+            поправь текст, если хочешь своё. Окончание .mp4 или .mp3 добавится само.
+          </p>
+        </div>
+
+        <div class="field">
           <label class="field-label" for="cookies-browser">
             Cookies (ВК / закрытые видео)
           </label>
@@ -630,6 +645,8 @@
     const doneWarn = $("done-warn");
     const urlInput = $("url");
     const folderInput = $("folder");
+    const filenameInput = $("filename");
+    const filenameHint = $("filename-hint");
     const qualitySelect = $("quality");
     const fieldQuality = $("field-quality");
     const cookiesSelect = $("cookies-browser");
@@ -657,6 +674,86 @@
     let pickedPage = "";
     let downloadBusy = false;
     let activeEmbedHint = "";
+    let suggestedName = "";
+    let nameDirty = false;
+    let lastPreviewUrl = "";
+    let previewState = "idle";
+    let previewToken = 0;
+    let previewTimer = null;
+    let previewAbort = null;
+    let previewTask = null;
+
+    const FILENAME_HINTS = {
+      idle:
+        "Качалка подставит имя с сайта. У Facebook из начала убираются просмотры и реакции — поправь текст, если хочешь своё. Окончание .mp4 или .mp3 добавится само.",
+      loading: "Смотрю, как ролик называется…",
+      ready: "Так файл будет называться. Поправь, если нужно. Окончание добавится само.",
+      miss: "Не увидела имя на сайте. Впиши своё или оставь пустым — возьму название при скачивании.",
+    };
+
+    function setFilenameHint(kind) {
+      if (!filenameHint) return;
+      filenameHint.textContent = FILENAME_HINTS[kind] || FILENAME_HINTS.idle;
+    }
+
+    function applySuggestedName(name) {
+      const clean = (name || "").trim();
+      if (!clean) return;
+      suggestedName = clean;
+      if (!nameDirty && filenameInput) {
+        filenameInput.value = clean;
+        setFilenameHint("ready");
+      }
+    }
+
+    function scheduleNamePreview(url) {
+      clearTimeout(previewTimer);
+      const target = (url || "").trim();
+      if (!/^https?:\/\//i.test(target)) return;
+      previewTimer = setTimeout(() => {
+        loadSuggestedName(target);
+      }, 700);
+    }
+
+    function loadSuggestedName(target) {
+      const token = ++previewToken;
+      if (previewAbort) previewAbort.abort();
+      const controller = new AbortController();
+      previewAbort = controller;
+      previewState = "loading";
+      if (!nameDirty) setFilenameHint("loading");
+      const task = (async () => {
+        try {
+          const res = await fetch("/api/preview-name", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: target,
+              cookies_browser: currentCookiesBrowser() || null,
+            }),
+            signal: controller.signal,
+          });
+          const data = await res.json();
+          if (token !== previewToken) return;
+          lastPreviewUrl = target;
+          if (data.ok && data.name) {
+            previewState = "ready";
+            applySuggestedName(data.name);
+          } else {
+            previewState = "miss";
+            if (!nameDirty) setFilenameHint("miss");
+          }
+        } catch (err) {
+          if (err && err.name === "AbortError") return;
+          if (token !== previewToken) return;
+          lastPreviewUrl = target;
+          previewState = "miss";
+          if (!nameDirty) setFilenameHint("miss");
+        }
+      })();
+      previewTask = task;
+      return task;
+    }
 
     function currentQuality() {
       const q = (qualitySelect.value || "best").toLowerCase();
@@ -897,10 +994,19 @@
           });
           button.classList.add("selected");
           button.setAttribute("aria-selected", "true");
+          if (!nameDirty) {
+            nameDirty = false;
+            applySuggestedName(video.title || "");
+            scheduleNamePreview(video.url);
+          }
         });
         list.appendChild(button);
       });
       pickedUrl = videos[0].url;
+      if (!nameDirty) {
+        applySuggestedName(videos[0].title || "");
+        scheduleNamePreview(videos[0].url);
+      }
       $("field-embeds").classList.remove("hidden");
       btnDownload.textContent = "Скачать выбранное";
       setWarn(formWarn, "На странице несколько роликов — выбери, какой скачать.");
@@ -908,7 +1014,7 @@
 
     async function resolveTarget(url) {
       if (pickedUrl && pickedPage === url) {
-        return { url: pickedUrl, hint: "" };
+        return { url: pickedUrl, title: "", hint: "" };
       }
       clearEmbeds();
       btnDownload.textContent = "Ищу видео…";
@@ -932,16 +1038,18 @@
         const title = videos[0].title || "видео";
         return {
           url: videos[0].url,
-          hint: "На странице нашёл встроенное видео «" + title + "». Качаю его.",
+          title,
+          hint: "На странице нашёл встроенное видео «" + title + "».",
         };
       }
       if (info.scanned) {
         return {
           url,
+          title: "",
           hint: "Встроенного плеера не нашёл — пробую скачать саму ссылку.",
         };
       }
-      return { url, hint: "" };
+      return { url, title: "", hint: "" };
     }
 
     async function startDownload() {
@@ -965,10 +1073,32 @@
       modeAudio.disabled = true;
       qualitySelect.disabled = true;
       if (cookiesSelect) cookiesSelect.disabled = true;
+      if (filenameInput) filenameInput.disabled = true;
       let embedHint = "";
       try {
         const target = await resolveTarget(url);
         if (!target) return;
+        if (
+          !nameDirty &&
+          target.title &&
+          filenameInput &&
+          !filenameInput.value.trim()
+        ) {
+          applySuggestedName(target.title);
+        }
+        if (!nameDirty && lastPreviewUrl !== target.url) {
+          setWarn(formWarn, "Смотрю, как ролик называется…");
+          await loadSuggestedName(target.url);
+          if (previewState === "ready" && filenameInput && filenameInput.value.trim()) {
+            if (filenameInput) filenameInput.disabled = false;
+            setWarn(
+              formWarn,
+              "Вот имя файла. Поправь его, если нужно, и снова нажми «Скачать»."
+            );
+            filenameInput.focus();
+            return;
+          }
+        }
         embedHint = target.hint || "";
         const res = await fetch("/api/download", {
           method: "POST",
@@ -976,6 +1106,7 @@
           body: JSON.stringify({
             url: target.url,
             folder: folder || null,
+            filename: (filenameInput && filenameInput.value.trim()) || null,
             mode: currentMode,
             quality: currentMode === "video" ? currentQuality() : "best",
             cookies_browser: currentCookiesBrowser() || null,
@@ -1020,6 +1151,7 @@
         modeAudio.disabled = false;
         qualitySelect.disabled = currentMode !== "video";
         if (cookiesSelect) cookiesSelect.disabled = false;
+        if (filenameInput) filenameInput.disabled = false;
         if ($("field-embeds").classList.contains("hidden")) {
           btnDownload.textContent = "Скачать";
         }
@@ -1066,6 +1198,12 @@
       } catch (_) {}
       showOnly("form");
       urlInput.value = "";
+      if (filenameInput) filenameInput.value = "";
+      suggestedName = "";
+      nameDirty = false;
+      lastPreviewUrl = "";
+      previewState = "idle";
+      setFilenameHint("idle");
       activeEmbedHint = "";
       clearEmbeds();
       setWarn(formWarn, "");
@@ -1088,10 +1226,21 @@
           localStorage.setItem(COOKIES_KEY, currentCookiesBrowser());
         } catch (_) {}
         updateCookiesHint();
+        if (!nameDirty && urlInput.value.trim()) {
+          lastPreviewUrl = "";
+          scheduleNamePreview(urlInput.value.trim());
+        }
       });
     }
     urlInput.addEventListener("input", () => {
       if (pickedPage && urlInput.value.trim() !== pickedPage) clearEmbeds();
+      nameDirty = false;
+      suggestedName = "";
+      lastPreviewUrl = "";
+      previewState = "idle";
+      if (filenameInput) filenameInput.value = "";
+      setFilenameHint("idle");
+      scheduleNamePreview(urlInput.value.trim());
     });
     urlInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") startDownload();
@@ -1099,6 +1248,14 @@
     folderInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") startDownload();
     });
+    if (filenameInput) {
+      filenameInput.addEventListener("input", () => {
+        nameDirty = filenameInput.value.trim() !== suggestedName;
+      });
+      filenameInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") startDownload();
+      });
+    }
     folderInput.addEventListener("change", () => {
       saveFolderLocal(currentFolder());
       updateFooter(currentFolder());

@@ -270,7 +270,7 @@ def _start_native_window() -> bool:
         "title": "Качалка",
         "url": URL,
         "width": 640,
-        "height": 860,
+        "height": 980,
         "min_size": (480, 640),
         "background_color": "#0f1117",
         "text_select": True,

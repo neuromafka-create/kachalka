@@ -356,6 +356,7 @@ _state: dict[str, Any] = {
     "speed": "",
     "size": "",
     "title": "",
+    "chosen_name": "",
     "filename": "",
     "error": "",
     "out_dir": str(DEFAULT_OUT),
@@ -711,7 +712,7 @@ def _progress_hook(d: dict[str, Any]) -> None:
             _state["speed"] = _format_speed(d.get("speed"))
             info = d.get("info_dict") or {}
             title = info.get("title")
-            if title:
+            if title and not _state.get("chosen_name"):
                 _state["title"] = title
             filename = d.get("filename")
             if filename:
@@ -723,7 +724,7 @@ def _progress_hook(d: dict[str, Any]) -> None:
             if filename:
                 _state["filename"] = Path(filename).name
             info = d.get("info_dict") or {}
-            if info.get("title"):
+            if info.get("title") and not _state.get("chosen_name"):
                 _state["title"] = info["title"]
 
 
@@ -743,6 +744,71 @@ def _normalize_quality(quality: str | None) -> str:
     return QUALITY_BEST
 
 
+# «119 reactions · 1.4K shares | Название» — так Facebook кладёт счётчики в имя.
+_COUNT_TOKEN = r"\d+(?:[ \u00a0.,]\d+)*(?:\s*(?:тыс\.?|млн\.?|[kmb]))?"
+_ENGAGE_UNIT = (
+    r"(?:views?|reactions?|comments?|shares?|likes?|"
+    r"просмотр(?:ов|а)?|реакци(?:й|и|я)|"
+    r"комментари(?:ев|й|я|и)|репост(?:ов|а)?)"
+)
+_ENGAGE_CHUNK = rf"{_COUNT_TOKEN}\s+{_ENGAGE_UNIT}"
+_ENGAGE_PREFIX = re.compile(
+    rf"^(?:{_ENGAGE_CHUNK}(?:\s*[·•|,]\s*{_ENGAGE_CHUNK})*)\s*\|\s*",
+    re.IGNORECASE,
+)
+_FILENAME_INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_FILENAME_RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", re.IGNORECASE)
+_FILENAME_EXTS = (
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".mov",
+    ".m4v",
+    ".m4a",
+    ".mp3",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".flac",
+    ".wav",
+)
+
+
+def _clean_site_title(title: str) -> str:
+    """Убрать из названия счётчики просмотров и реакций в начале."""
+    text = re.sub(r"\s+", " ", title or "").strip()
+    cleaned = _ENGAGE_PREFIX.sub("", text).strip()
+    cleaned = re.sub(r"\s*\|\s*Facebook$", "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned or text
+
+
+def _filename_stem(raw: str | None) -> str | None:
+    """Имя без папки и расширения. Пустая строка — оставить название с сайта."""
+    text = _clean_site_title(raw or "")
+    if not text:
+        return None
+    text = text.replace("\\", "/").split("/")[-1].strip()
+    lower = text.lower()
+    for ext in _FILENAME_EXTS:
+        if lower.endswith(ext) and len(text) > len(ext):
+            text = text[: -len(ext)].strip()
+            break
+    text = _FILENAME_INVALID.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    if not text or text in {".", ".."}:
+        return None
+    if _FILENAME_RESERVED.match(text):
+        text += "_"
+    return text[:120]
+
+
+def _outtmpl(out_dir: Path, filename_stem: str | None) -> str:
+    if filename_stem:
+        literal = filename_stem.replace("%", "%%")
+        return str(out_dir / f"{literal}.%(ext)s")
+    return str(out_dir / "%(title).120s.%(ext)s")
+
+
 def _ydl_opts(
     out_dir: Path,
     mode: str = MODE_VIDEO,
@@ -751,10 +817,11 @@ def _ydl_opts(
     cookies_file: Path | None = None,
     cookies_browser: str | None = None,
     player_clients: list[str] | None = None,
+    filename_stem: str | None = None,
 ) -> dict[str, Any]:
     """Опции yt-dlp: видео (mp4 + качество) или только звук (mp3)."""
     opts: dict[str, Any] = {
-        "outtmpl": str(out_dir / "%(title).120s.%(ext)s"),
+        "outtmpl": _outtmpl(out_dir, filename_stem),
         "noplaylist": True,
         "progress_hooks": [_progress_hook],
         "quiet": True,
@@ -863,6 +930,7 @@ def _do_download(
     mode: str = MODE_VIDEO,
     quality: str = QUALITY_BEST,
     cookies_browser: str | None = None,
+    filename_stem: str | None = None,
 ) -> None:
     mode = _normalize_mode(mode)
     quality = _normalize_quality(quality)
@@ -890,7 +958,8 @@ def _do_download(
                     "percent": 0.0,
                     "speed": "",
                     "size": "",
-                    "title": "",
+                    "title": filename_stem or "",
+                    "chosen_name": filename_stem or "",
                     "filename": "",
                     "error": "",
                     "out_dir": str(out_dir),
@@ -913,6 +982,7 @@ def _do_download(
                 cookies_file=use_file,
                 cookies_browser=use_browser,
                 player_clients=player_clients,
+                filename_stem=filename_stem,
             )
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -1023,6 +1093,7 @@ def _pump_queue() -> None:
         _state["size"] = ""
         _state["error"] = ""
         _state["title"] = ""
+        _state["chosen_name"] = ""
         _state["filename"] = ""
     threading.Thread(
         target=_do_download,
@@ -1092,7 +1163,13 @@ class DownloadRequest(BaseModel):
     folder: str | None = None
     mode: str | None = MODE_VIDEO  # video | audio
     quality: str | None = QUALITY_BEST  # best | 720 | 480
-    # none | chrome | edge | firefox | opera | brave | chromium
+    # none | chrome | edge | firefox | opera | brave | chromium | yandex
+    cookies_browser: str | None = None
+    filename: str | None = None
+
+
+class PreviewNameRequest(BaseModel):
+    url: str
     cookies_browser: str | None = None
 
 
@@ -1117,7 +1194,7 @@ def _present_found(videos: list[dict[str, Any]]) -> list[dict[str, str]]:
         if not url.startswith("http") or url in seen:
             continue
         seen.add(url)
-        title = str(item.get("title") or "").strip() or "Видео"
+        title = _clean_site_title(str(item.get("title") or "")) or "Видео"
         out.append(
             {
                 "url": url,
@@ -1250,6 +1327,75 @@ def browse_folder(req: BrowseFolderRequest | None = None) -> dict[str, Any]:
     return _browse_folder_dialog(str(initial))
 
 
+def _quiet_ydl_opts(*, browser: str | None, use_file: bool) -> dict[str, Any]:
+    """Метаданные ролика без скачивания и без прогресса в окне."""
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+        "retries": 2,
+        "extractor_retries": 1,
+        "http_headers": dict(_HTTP_HEADERS),
+    }
+    if (FFMPEG_BIN / "ffmpeg.exe").exists():
+        opts["ffmpeg_location"] = str(FFMPEG_BIN)
+    if use_file:
+        cookies = _find_cookies_file()
+        if cookies is not None:
+            opts["cookiefile"] = str(cookies)
+        elif browser:
+            opts["cookiesfrombrowser"] = (browser,)
+    return opts
+
+
+def _extract_title(url: str, *, browser: str | None, use_file: bool) -> str:
+    with yt_dlp.YoutubeDL(_quiet_ydl_opts(browser=browser, use_file=use_file)) as ydl:
+        info = ydl.extract_info(url, download=False) or {}
+    if info.get("_type") == "playlist":
+        entries = [item for item in (info.get("entries") or []) if item]
+        if entries:
+            info = entries[0]
+    title = str(info.get("title") or "").strip()
+    if not title:
+        raise yt_dlp.utils.DownloadError("no title")
+    return title
+
+
+def _lookup_title(url: str, browser: str | None) -> str:
+    try:
+        return _extract_title(url, browser=None, use_file=False)
+    except Exception as exc:
+        if not _needs_auth_retry(exc):
+            raise
+        if _find_cookies_file() is None and not browser:
+            raise
+        return _extract_title(url, browser=browser, use_file=True)
+
+
+@app.post("/api/preview-name")
+def preview_name(req: PreviewNameRequest) -> dict[str, Any]:
+    """Узнать имя файла до скачивания, без записи ролика на диск."""
+    url = _normalize_url(req.url or "")
+    if not url.startswith("http"):
+        return {
+            "ok": False,
+            "error": "Это не похоже на ссылку. Вставь адрес вида https://…",
+        }
+    try:
+        title = _lookup_title(url, _normalize_browser(req.cookies_browser))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": _human_error(exc, url=url)}
+    name = _filename_stem(title)
+    if not name:
+        return {
+            "ok": False,
+            "error": "Сайт не сказал, как называется ролик. Впиши имя сам.",
+        }
+    return {"ok": True, "name": name}
+
+
 @app.post("/api/inspect")
 def inspect_link(req: InspectRequest) -> dict[str, Any]:
     """Найти ролики, встроенные в обычную страницу.
@@ -1307,6 +1453,13 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
     elif cookies_browser:
         extra = f"Буду брать cookies из браузера «{_browser_title(cookies_browser)}»"
         warning = f"{warning} {extra}".strip() if warning else extra
+    raw_name = (req.filename or "").strip()
+    stem = _filename_stem(raw_name) if raw_name else None
+    if raw_name and not stem:
+        return {
+            "ok": False,
+            "error": "В имени файла не осталось нормальных символов. Поправь его.",
+        }
 
     # Статус до запуска потока: иначе первый опрос ещё видит idle
     # и окно прячет прогресс, будто кнопка ничего не сделала.
@@ -1317,7 +1470,8 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
                 "percent": 0.0,
                 "speed": "",
                 "size": "",
-                "title": "",
+                "title": stem or "",
+                "chosen_name": stem or "",
                 "filename": "",
                 "error": "",
                 "out_dir": str(out_dir),
@@ -1329,7 +1483,7 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
         )
     thread = threading.Thread(
         target=_do_download,
-        args=(url, req.folder, mode, quality, cookies_browser),
+        args=(url, req.folder, mode, quality, cookies_browser, stem),
         daemon=True,
     )
     thread.start()
@@ -1342,6 +1496,7 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
         "url": url,
         "cookies_browser": cookies_browser,
         "cookies_file": str(cookies_file) if cookies_file else None,
+        "filename": stem,
     }
 
 
@@ -1384,6 +1539,7 @@ def reset_status() -> dict[str, Any]:
                 "speed": "",
                 "size": "",
                 "title": "",
+                "chosen_name": "",
                 "filename": "",
                 "error": "",
                 "out_dir": out_dir,
