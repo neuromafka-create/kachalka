@@ -273,6 +273,38 @@
     });
   }
 
+  const PRUFFME_PATH = /^user\/[0-9a-f]{16,64}\/video\/[0-9a-f]{16,64}(?:\/\d{3,4})?\/video\.(?:mp4|webm|mkv|mov|m4v)$/i;
+
+  function pruffmeFile(raw) {
+    const text = String(raw || "").trim();
+    if (!text) return null;
+    let media;
+    try {
+      media = JSON.parse(text);
+    } catch (_err) {
+      return null;
+    }
+    if (!media || typeof media !== "object") return null;
+    let path = String(media.path || "").replace(/\\/g, "/").replace(/^\/+/, "");
+    const direct = String(media.url || "");
+    if (direct.indexOf("https://") === 0) {
+      try {
+        const parsed = new URL(direct);
+        const host = parsed.hostname.toLowerCase();
+        if ((host === "pruffme.com" || host.endsWith(".pruffme.com")) && !parsed.search) {
+          path = decodeURIComponent(parsed.pathname || "").replace(/^\/+/, "");
+        }
+      } catch (_err) {
+        path = String(media.path || "").replace(/\\/g, "/").replace(/^\/+/, "");
+      }
+    }
+    if (!PRUFFME_PATH.test(path)) return null;
+    return {
+      url: "https://video.pruffme.com/" + path,
+      title: String(media.name || ""),
+    };
+  }
+
   function collectVideos(page) {
     const href = String((page && page.href) || "");
     const pageTitle = (page && page.title) || "";
@@ -281,6 +313,9 @@
     if (isVideoUrl(href)) {
       pushItem(found, href, pageTitle, "page");
     }
+
+    const pruffme = pruffmeFile(page && page.mediaJson);
+    if (pruffme) pushItem(found, pruffme.url, pruffme.title, "file");
 
     (page && page.iframes || []).forEach(function (frame) {
       const src = absUrl(frame && (frame.src || frame.dataSrc), href);

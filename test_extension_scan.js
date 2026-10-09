@@ -113,4 +113,17 @@ assert.strictEqual(gc.length, 1);
 assert.strictEqual(gc[0].url, gcPlayer);
 assert.strictEqual(gc[0].title, "GetCourse");
 
+const pruffme = scan.collectVideos({
+  href: "https://pruffme.com/landing/u1/tmp1",
+  title: "Страница",
+  mediaJson:
+    '{"name":"Вебинар про сайты","url":null,"path":"user/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/video/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/video.mp4"}',
+});
+assert.strictEqual(pruffme.length, 1);
+assert.strictEqual(
+  pruffme[0].url,
+  "https://video.pruffme.com/user/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/video/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/video.mp4"
+);
+assert.strictEqual(pruffme[0].title, "Вебинар про сайты");
+
 console.log("extension scan ok");

@@ -7,7 +7,7 @@
 
 #define MyAppName "Качалка"
 #define MyAppNameEn "Kachalka"
-#define MyAppVersion "1.3.3"
+#define MyAppVersion "1.3.5"
 #define MyAppPublisher "NeyroVibe"
 #define MyAppURL "https://t.me/tekhnocafe"
 #define MyAppExeName "Kachalka.exe"
@@ -32,6 +32,7 @@ PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
 ; Тот же AppId: повторный запуск Setup обновляет копию в %LocalAppData%\Kachalka.
 ; Папку «Скачанное» установщик не удаляет — её нет в списке файлов.
+; Папка cookies\ — запомненный вход пользователя. Её тоже не ставим и не удаляем.
 UsePreviousAppDir=yes
 UsePreviousGroup=yes
 UsePreviousTasks=yes
@@ -39,8 +40,8 @@ CloseApplications=yes
 CloseApplicationsFilter=Kachalka.exe
 ; Запуск после установки — только галочка в мастере, без второго окна.
 RestartApplications=no
-VersionInfoVersion=1.3.3.0
-VersionInfoProductVersion=1.3.3.0
+VersionInfoVersion=1.3.5.0
+VersionInfoProductVersion=1.3.5.0
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
@@ -51,7 +52,7 @@ Name: "desktopicon"; Description: "Ярлык на рабочем столе"; G
 
 [Files]
 ; onedir-сборка PyInstaller
-Source: "dist\Kachalka\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\Kachalka\*"; DestDir: "{app}"; Excludes: "cookies\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Отдельный .ico для ярлыков (на случай кэша Windows)
 Source: "assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "extension\*"; DestDir: "{app}\extension"; Flags: ignoreversion recursesubdirs createallsubdirs

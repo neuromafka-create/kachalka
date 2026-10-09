@@ -574,8 +574,9 @@
             <option value="brave">Войти через Brave</option>
           </select>
           <p class="field-hint" id="cookies-hint">
-            Для закрытых роликов ВК войди в аккаунт в Яндекс.Браузере и выбери его здесь.
-            Перед скачиванием закрой браузер полностью, вместе со значком в трее.
+            Для закрытых роликов выбери браузер, где ты вошла.
+            Первый раз закрой его полностью, вместе со значком в трее:
+            Качалка запомнит вход, и дальше браузер можно не закрывать.
             Либо положи файл <code>cookies.txt</code> рядом с Качалкой.
           </p>
         </div>
@@ -696,6 +697,30 @@
       filenameHint.textContent = FILENAME_HINTS[kind] || FILENAME_HINTS.idle;
     }
 
+    function isUsefulPageTitle(title) {
+      const name = String(title || "").trim().toLowerCase();
+      if (name.length < 3) return false;
+      const generic = [
+        "видео",
+        "video",
+        "файл на странице",
+        "youtube",
+        "вк",
+        "rutube",
+        "vimeo",
+        "getcourse",
+        "pruffme",
+        "dzen",
+        "дзен",
+        "ok",
+        "twitch",
+        "tiktok",
+        "dailymotion",
+        "player",
+      ];
+      return generic.indexOf(name) < 0;
+    }
+
     function applySuggestedName(name) {
       const clean = (name || "").trim();
       if (!clean) return;
@@ -766,6 +791,7 @@
     }
 
     let cookiesFileName = "";
+    let savedBrowsers = [];
 
     function updateCookiesHint() {
       if (!cookiesHint) return;
@@ -777,18 +803,23 @@
         return;
       }
       const v = currentCookiesBrowser();
-      if (v === "chrome" || v === "edge") {
+      if (!v) {
+        cookiesHint.innerHTML =
+          "Для закрытых роликов выбери браузер, где ты вошла. Первый раз закрой его полностью, вместе со значком в трее: Качалка запомнит вход, и дальше браузер можно не закрывать. Либо положи файл <code>cookies.txt</code> рядом с Качалкой.";
+        return;
+      }
+      if ((v === "chrome" || v === "edge") && savedBrowsers.indexOf(v) < 0) {
         cookiesHint.textContent =
           "Chrome и Edge не отдают cookies другим программам. Войди в ВК в Яндекс.Браузере и выбери его, либо положи cookies.txt рядом с Качалкой.";
         return;
       }
-      if (v === "yandex") {
+      if (savedBrowsers.indexOf(v) >= 0) {
         cookiesHint.textContent =
-          "Войди в ВК в Яндекс.Браузере. Перед скачиванием закрой его полностью, вместе со значком в трее.";
+          "Вход из этого браузера уже сохранён в Качалке. Его можно не закрывать. Чтобы обновить вход, закрой браузер один раз и скачай ролик.";
         return;
       }
-      cookiesHint.innerHTML =
-        "Для закрытых роликов ВК войди в аккаунт в браузере и выбери его здесь. Перед скачиванием закрой браузер полностью, вместе со значком в трее. Либо положи файл <code>cookies.txt</code> рядом с Качалкой.";
+      cookiesHint.textContent =
+        "Первый раз закрой этот браузер полностью, вместе со значком в трее. Качалка запомнит вход, и дальше его можно не закрывать.";
     }
 
     function setMode(mode) {
@@ -1039,6 +1070,7 @@
         return {
           url: videos[0].url,
           title,
+          kind: videos[0].kind || "",
           hint: "На странице нашёл встроенное видео «" + title + "».",
         };
       }
@@ -1078,6 +1110,24 @@
       try {
         const target = await resolveTarget(url);
         if (!target) return;
+        if (
+          !nameDirty &&
+          target.kind === "file" &&
+          isUsefulPageTitle(target.title) &&
+          filenameInput &&
+          !filenameInput.value.trim()
+        ) {
+          applySuggestedName(target.title);
+          lastPreviewUrl = target.url;
+          previewState = "ready";
+          filenameInput.disabled = false;
+          setWarn(
+            formWarn,
+            "Вот имя файла. Поправь его, если нужно, и снова нажми «Скачать»."
+          );
+          filenameInput.focus();
+          return;
+        }
         if (
           !nameDirty &&
           target.title &&
@@ -1286,9 +1336,11 @@
         const cfg = await res.json();
         defaultFolder = cfg.default_folder || "";
         cookiesFileName = cfg.cookies_file_name || "";
+        savedBrowsers = Array.isArray(cfg.saved_browsers) ? cfg.saved_browsers : [];
       } catch (_) {
         defaultFolder = "";
         cookiesFileName = "";
+        savedBrowsers = [];
       }
 
       let saved = "";

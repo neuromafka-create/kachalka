@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from http.cookiejar import Cookie
 from pathlib import Path
+from unittest.mock import patch
 
 import yt_dlp.cookies as cookies
 from yt_dlp.utils import DownloadError
@@ -88,6 +90,7 @@ class BrowserCookieTests(unittest.TestCase):
         )
         self.assertIn("Яндекс.Браузер", locked)
         self.assertIn("трее", locked)
+        self.assertIn("запомнит", locked)
         self.assertNotIn("DPAPI", locked)
 
         bound = app._human_error(
@@ -129,6 +132,196 @@ class BrowserCookieTests(unittest.TestCase):
         )
         self.assertIn('<option value="yandex">Войти через Яндекс.Браузер</option>', html)
         self.assertIn('"yandex"', html)
+        self.assertIn("запомнит вход", html)
+        self.assertIn("saved_browsers", html)
+        self.assertIn("savedBrowsers", html)
+
+
+def _session_cookie() -> Cookie:
+    """Сессионная cookie: discard=True, без срока. В файл её надо сохранить явно."""
+    return Cookie(
+        0,
+        "sid",
+        "test-value",
+        None,
+        False,
+        "vk.ru",
+        True,
+        False,
+        "/",
+        True,
+        True,
+        None,
+        True,
+        None,
+        None,
+        {},
+    )
+
+
+def _jar_with_sid() -> cookies.YoutubeDLCookieJar:
+    jar = cookies.YoutubeDLCookieJar()
+    jar.set_cookie(_session_cookie())
+    return jar
+
+
+class SavedBrowserCookiesTests(unittest.TestCase):
+    def test_saves_session_cookie_and_reuses_when_browser_is_locked(self) -> None:
+        calls = {"n": 0}
+
+        def fake(browser, *args, **kwargs):  # noqa: ANN001
+            calls["n"] += 1
+            if calls["n"] == 1:
+                self.assertEqual(browser, "yandex")
+                return _jar_with_sid()
+            raise DownloadError(f"could not copy {browser} cookie database")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(app, "_cookie_cache_dir", return_value=root),
+                patch.object(cookies, "extract_cookies_from_browser", fake),
+            ):
+                path, cached = app._resolve_browser_cookies("yandex")
+                self.assertFalse(cached)
+                self.assertEqual(path, root / "yandex.txt")
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("sid", text)
+                self.assertIn("test-value", text)
+                loaded = cookies.YoutubeDLCookieJar()
+                loaded.load(str(path))
+                self.assertIn("sid", [item.name for item in loaded])
+
+                again, from_cache = app._resolve_browser_cookies("yandex")
+                self.assertTrue(from_cache)
+                self.assertEqual(again, path)
+                self.assertIn("sid", again.read_text(encoding="utf-8"))
+
+                with self.assertRaises(DownloadError) as caught:
+                    app._resolve_browser_cookies("firefox")
+                self.assertIn("firefox", str(caught.exception).lower())
+                self.assertFalse((root / "firefox.txt").exists())
+
+    def test_empty_jar_does_not_erase_saved_login(self) -> None:
+        calls = {"n": 0}
+
+        def fake(browser, *args, **kwargs):  # noqa: ANN001
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _jar_with_sid()
+            return cookies.YoutubeDLCookieJar()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(app, "_cookie_cache_dir", return_value=root),
+                patch.object(cookies, "extract_cookies_from_browser", fake),
+            ):
+                path, cached = app._resolve_browser_cookies("opera")
+                self.assertFalse(cached)
+                kept = path.read_text(encoding="utf-8")
+                again, from_cache = app._resolve_browser_cookies("opera")
+                self.assertTrue(from_cache)
+                self.assertEqual(again.read_text(encoding="utf-8"), kept)
+                self.assertIn("sid", kept)
+
+    def test_app_bound_without_a_saved_file_creates_nothing(self) -> None:
+        def fake(browser, *args, **kwargs):  # noqa: ANN001
+            raise DownloadError(
+                f"{browser} cookies are app-bound (v20) and were not shared"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(app, "_cookie_cache_dir", return_value=root),
+                patch.object(cookies, "extract_cookies_from_browser", fake),
+            ):
+                with self.assertRaises(DownloadError) as caught:
+                    app._resolve_browser_cookies("chrome")
+                self.assertIn("app-bound", str(caught.exception))
+                self.assertFalse((root / "chrome.txt").exists())
+                self.assertEqual(list(root.iterdir()), [])
+
+    def test_empty_saved_file_is_not_reused(self) -> None:
+        def fake(browser, *args, **kwargs):  # noqa: ANN001
+            raise DownloadError(f"could not copy {browser} cookie database")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "brave.txt").write_text("", encoding="utf-8")
+            with (
+                patch.object(app, "_cookie_cache_dir", return_value=root),
+                patch.object(cookies, "extract_cookies_from_browser", fake),
+            ):
+                with self.assertRaises(DownloadError):
+                    app._resolve_browser_cookies("brave")
+
+    def test_browser_name_cannot_escape_the_cache_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(app, "_cookie_cache_dir", return_value=root):
+                with self.assertRaises(DownloadError):
+                    app._resolve_browser_cookies(r"..\cookies")
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_manual_cookies_file_beats_the_browser(self) -> None:
+        def fake(browser, *args, **kwargs):  # noqa: ANN001
+            raise AssertionError("browser cookies must not be read")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manual = Path(tmp) / "cookies.txt"
+            manual.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+            with (
+                patch.object(app, "_find_cookies_file", return_value=manual),
+                patch.object(cookies, "extract_cookies_from_browser", fake),
+            ):
+                opts = app._quiet_ydl_opts(browser="yandex", use_file=True)
+            self.assertEqual(opts["cookiefile"], str(manual))
+            self.assertNotIn("cookiesfrombrowser", opts)
+
+    def test_preview_uses_saved_login_when_the_browser_is_locked(self) -> None:
+        calls = {"n": 0}
+
+        def fake(browser, *args, **kwargs):  # noqa: ANN001
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _jar_with_sid()
+            raise DownloadError(f"could not copy {browser} cookie database")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(app, "_cookie_cache_dir", return_value=root),
+                patch.object(app, "_find_cookies_file", return_value=None),
+                patch.object(cookies, "extract_cookies_from_browser", fake),
+            ):
+                first = app._quiet_ydl_opts(browser="yandex", use_file=True)
+                second = app._quiet_ydl_opts(browser="yandex", use_file=True)
+            self.assertEqual(first["cookiefile"], str(root / "yandex.txt"))
+            self.assertNotIn("cookiesfrombrowser", first)
+            self.assertNotIn("cookiesfrombrowser", second)
+            self.assertEqual(second["cookiefile"], str(root / "yandex.txt"))
+            self.assertTrue((root / "yandex.txt").is_file())
+            self.assertEqual(calls["n"], 2)
+
+    def test_config_lists_saved_browsers(self) -> None:
+        def fake(browser, *args, **kwargs):  # noqa: ANN001
+            if browser == "yandex":
+                return _jar_with_sid()
+            raise DownloadError(f"could not copy {browser} cookie database")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(app, "_cookie_cache_dir", return_value=root),
+                patch.object(cookies, "extract_cookies_from_browser", fake),
+            ):
+                app._resolve_browser_cookies("yandex")
+                saved = app._saved_browsers()
+                cfg = app.get_config()
+            self.assertEqual(saved, ["yandex"])
+            self.assertEqual(cfg["saved_browsers"], ["yandex"])
 
 
 if __name__ == "__main__":

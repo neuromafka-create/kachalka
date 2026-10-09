@@ -494,6 +494,76 @@ def _find_cookies_file() -> Path | None:
     return None
 
 
+def _cookie_cache_dir() -> Path:
+    """Запомненный вход из браузеров. Установщик эту папку не удаляет."""
+    return BASE / "cookies"
+
+
+_cookie_io_lock = threading.Lock()
+
+
+def _saved_browser_cookies_path(browser: str) -> Path:
+    name = (browser or "").strip().lower()
+    if name not in BROWSER_CHOICES:
+        raise yt_dlp.utils.DownloadError(
+            f"could not find {browser} cookies database"
+        )
+    return _cookie_cache_dir() / f"{name}.txt"
+
+
+def _saved_cookies_usable(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _saved_browsers() -> list[str]:
+    return [
+        browser
+        for browser in BROWSER_CHOICES
+        if _saved_cookies_usable(_saved_browser_cookies_path(browser))
+    ]
+
+
+def _store_cookie_jar(jar: Any, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    try:
+        jar.save(str(tmp), ignore_discard=True, ignore_expires=True)
+        tmp.replace(dest)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _resolve_browser_cookies(browser: str) -> tuple[Path, bool]:
+    """Файл с входом из браузера и флаг «это уже сохранённая копия».
+
+    Свежее чтение обновляет копию. Если браузер держит базу или не отдаёт
+    cookies, а копия уже есть, берём её и браузер можно не закрывать.
+    """
+    saved = _saved_browser_cookies_path(browser)
+    with _cookie_io_lock:
+        try:
+            jar = yt_dlp.cookies.extract_cookies_from_browser(browser)
+        except Exception:
+            if _saved_cookies_usable(saved):
+                return saved, True
+            raise
+        if not any(True for _ in jar):
+            if _saved_cookies_usable(saved):
+                return saved, True
+            raise yt_dlp.utils.DownloadError(
+                f"could not find {browser} cookies database"
+            )
+        _store_cookie_jar(jar, saved)
+        return saved, False
+
+
 def _normalize_browser(browser: str | None) -> str | None:
     if not browser:
         return None
@@ -545,11 +615,13 @@ def _human_error(exc: BaseException, *, url: str = "") -> str:
         if "could not copy yandex cookie" in low:
             return (
                 "Яндекс.Браузер держит файл cookies. "
-                "Закрой его полностью, в том числе значок в трее, и попробуй снова."
+                "Закрой его полностью, вместе со значком в трее, один раз: "
+                "Качалка запомнит вход, и дальше браузер можно не закрывать."
             )
         return (
             "Браузер держит файл cookies. "
-            "Закрой его полностью, в том числе значок в трее, и попробуй снова."
+            "Закрой его полностью, вместе со значком в трее, один раз: "
+            "Качалка запомнит вход, и дальше его можно не закрывать."
         )
     if "app-bound" in low or "(v20)" in low:
         if "yandex cookies are app-bound" in low:
@@ -568,8 +640,9 @@ def _human_error(exc: BaseException, *, url: str = "") -> str:
     if "failed to decrypt with dpapi" in low:
         return (
             "Не удалось прочитать cookies браузера. "
-            "Закрой его полностью, в том числе значок в трее, и попробуй снова, "
-            "либо положи cookies.txt рядом с Качалкой "
+            "Закрой его полностью, в том числе значок в трее, один раз: "
+            "Качалка запомнит вход, и дальше браузер можно не закрывать. "
+            "Либо положи cookies.txt рядом с Качалкой "
             "(экспорт расширением «Get cookies.txt LOCALLY»)."
         )
     if "could not find" in low and "cookie" in low:
@@ -593,8 +666,9 @@ def _human_error(exc: BaseException, *, url: str = "") -> str:
         if vk:
             return (
                 "ВК: видео закрыто или нужен вход. "
-                "Выбери «Войти через Яндекс.Браузер» и закрой его перед скачиванием, "
-                "или положи cookies.txt рядом с Качалкой"
+                "Выбери браузер, где ты вошла. Первый раз закрой его полностью — "
+                "Качалка запомнит вход, и дальше браузер можно не закрывать. "
+                "Если сохранённый вход устарел, закрой браузер ещё один раз."
             )
         return "Видео недоступно — оно закрыто, ограничено по региону или требует входа"
     if "not available in your region" in low or "недоступно в вашем регионе" in low:
@@ -937,6 +1011,7 @@ def _do_download(
     url = _normalize_url(url)
     browser = _normalize_browser(cookies_browser)
     cookies_file = _find_cookies_file()
+    browser_cookie_file: Path | None = None
 
     try:
         out_dir, warning = _resolve_out_dir(folder)
@@ -948,7 +1023,11 @@ def _do_download(
             hint = f"Cookies: {cookies_file.name}"
             warning = f"{warning} {hint}".strip() if warning else hint
         elif browser:
-            hint = f"Cookies из браузера «{_browser_title(browser)}»"
+            browser_cookie_file, from_cache = _resolve_browser_cookies(browser)
+            if from_cache:
+                hint = f"Сохранённый вход из «{_browser_title(browser)}»"
+            else:
+                hint = f"Вход из «{_browser_title(browser)}» сохранён"
             warning = f"{warning} {hint}".strip() if warning else hint
 
         with _lock:
@@ -989,8 +1068,9 @@ def _do_download(
                 path = _final_path(ydl, info or {}, mode)
                 return info, path
 
+        use_file = cookies_file or browser_cookie_file
         try:
-            info, path = _run(use_file=cookies_file, use_browser=browser)
+            info, path = _run(use_file=use_file, use_browser=None)
         except Exception as first_exc:  # noqa: BLE001
             # YouTube: страница открытая, а файл по обычной ссылке CDN режет 403.
             # Клиент android отдаёт цельный mp4 (часто 360p) без этого отказа.
@@ -1001,8 +1081,8 @@ def _do_download(
                         + "YouTube не отдал полное качество, беру запасной файл…"
                     ).strip()
                 info, path = _run(
-                    use_file=cookies_file,
-                    use_browser=browser,
+                    use_file=use_file,
+                    use_browser=None,
                     player_clients=["android"],
                 )
                 height = int((info or {}).get("height") or 0)
@@ -1025,17 +1105,22 @@ def _do_download(
                 best_rank = _cookie_failure_rank(first_exc)
                 for b in VK_COOKIE_RETRY:
                     try:
+                        saved, cached = _resolve_browser_cookies(b)
                         with _lock:
                             _state["warning"] = (
                                 (warning + " " if warning else "")
                                 + f"Пробую браузер «{_browser_title(b)}»…"
                             ).strip()
-                        info, path = _run(use_file=None, use_browser=b)
+                        info, path = _run(use_file=saved, use_browser=None)
                         best_exc = None  # type: ignore[assignment]
+                        note = (
+                            f"Сохранённый вход из «{_browser_title(b)}»"
+                            if cached
+                            else f"Вход из «{_browser_title(b)}» сохранён"
+                        )
                         with _lock:
                             _state["warning"] = (
-                                (warning + " " if warning else "")
-                                + f"Вошёл через «{_browser_title(b)}»"
+                                (warning + " " if warning else "") + note
                             ).strip()
                         break
                     except Exception as retry_exc:  # noqa: BLE001
@@ -1225,6 +1310,7 @@ def get_config() -> dict[str, Any]:
         "cookies_file": str(cookies) if cookies else None,
         "cookies_file_name": cookies.name if cookies else None,
         "browsers": list(BROWSER_CHOICES),
+        "saved_browsers": _saved_browsers(),
     }
 
 
@@ -1346,7 +1432,8 @@ def _quiet_ydl_opts(*, browser: str | None, use_file: bool) -> dict[str, Any]:
         if cookies is not None:
             opts["cookiefile"] = str(cookies)
         elif browser:
-            opts["cookiesfrombrowser"] = (browser,)
+            saved, _cached = _resolve_browser_cookies(browser)
+            opts["cookiefile"] = str(saved)
     return opts
 
 
@@ -1451,7 +1538,12 @@ def start_download(req: DownloadRequest) -> dict[str, Any]:
         extra = f"Найден {cookies_file.name} — использую для входа"
         warning = f"{warning} {extra}".strip() if warning else extra
     elif cookies_browser:
-        extra = f"Буду брать cookies из браузера «{_browser_title(cookies_browser)}»"
+        if _saved_cookies_usable(_saved_browser_cookies_path(cookies_browser)):
+            extra = f"Сохранённый вход из «{_browser_title(cookies_browser)}»"
+        else:
+            extra = (
+                f"Возьму вход из «{_browser_title(cookies_browser)}» и запомню его"
+            )
         warning = f"{warning} {extra}".strip() if warning else extra
     raw_name = (req.filename or "").strip()
     stem = _filename_stem(raw_name) if raw_name else None

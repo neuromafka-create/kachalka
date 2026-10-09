@@ -160,6 +160,51 @@ def _has_secret(url: str) -> bool:
     return bool(_secret_suffix(urlparse(url).query))
 
 
+# Запись Pruffme: в HTML лежит path, а сам файл — на video.pruffme.com.
+_PRUFFME_PATH = re.compile(
+    r"user/[0-9a-f]{16,64}/video/[0-9a-f]{16,64}"
+    r"(?:/\d{3,4})?/video\.(?:mp4|webm|mkv|mov|m4v)$",
+    re.I,
+)
+_PRUFFME_EMBEDDED = re.compile(
+    r"embedded_media_content\s*=\s*function\s*\(\)\s*\{\s*/\*(.*?)\*/\s*\}",
+    re.S,
+)
+
+
+def _pruffme_file_url(media: dict[str, Any]) -> str:
+    """Прямой файл записи. Плейлист m3u8 не берём: mp4 уже целый ролик."""
+    direct = str(media.get("url") or "").strip()
+    if direct.startswith("https://"):
+        parsed = urlparse(direct)
+        path = unquote(parsed.path or "").lstrip("/")
+        host = _host(direct)
+        if (
+            _host_is(host, "pruffme.com")
+            and _PRUFFME_PATH.fullmatch(path)
+            and not parsed.query
+        ):
+            return "https://video.pruffme.com/" + path
+    path = str(media.get("path") or "").strip().replace("\\", "/").lstrip("/")
+    if _PRUFFME_PATH.fullmatch(path):
+        return "https://video.pruffme.com/" + path
+    return ""
+
+
+def _add_pruffme(html: str, page_url: str, collector: "_Collector") -> None:
+    for raw in _PRUFFME_EMBEDDED.findall(html or ""):
+        try:
+            media = json.loads(raw.strip())
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(media, dict):
+            continue
+        url = _pruffme_file_url(media)
+        if not url:
+            continue
+        collector.add(url, str(media.get("name") or ""), "file", page_url)
+
+
 def _getcourse_player(url: str) -> bool:
     """Подписанный плеер GetCourse. Сам json= обязателен, иначе это не ролик."""
     try:
@@ -557,6 +602,7 @@ def find_embedded_videos(html: str, page_url: str) -> list[dict[str, str]]:
         # Кривой HTML не должен прятать то, что уже нашли и что видно регулярками.
         pass
     _scan_text(html, page_url, collector)
+    _add_pruffme(html, page_url, collector)
     alone = len(collector.items) == 1
     videos: list[dict[str, str]] = []
     for item in collector.items:

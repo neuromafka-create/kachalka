@@ -142,6 +142,47 @@ class FindEmbeddedTests(unittest.TestCase):
         self.assertEqual(found[0]["title"], "GetCourse")
         self.assertIn("s=abc123", found[0]["url"])
 
+    def test_pruffme_landing_points_at_the_mp4(self) -> None:
+        html = """
+        <script>
+        var embedded_media_content = function(){/*
+            {"name":"Вебинар про сайты","url":null,
+             "path":"user/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/video/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/video.mp4",
+             "preview":"https://video.pruffme.com/user/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/video/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/thumbs/preview.jpg"}
+        */}.toString().slice(15,-3);
+        </script>
+        """
+        found = pv.find_embedded_videos(html, "https://pruffme.com/landing/u1/tmp1")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(
+            found[0]["url"],
+            "https://video.pruffme.com/user/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+            "video/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/video.mp4",
+        )
+        self.assertEqual(found[0]["title"], "Вебинар про сайты")
+
+    def test_pruffme_escaped_path_is_the_same_file(self) -> None:
+        html = (
+            '<script>var embedded_media_content = function(){/*'
+            '{"name":"\\u0412\\u0435\\u0431\\u0438\\u043d\\u0430\\u0440",'
+            '"url":null,'
+            '"path":"user\\/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\/video\\/'
+            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\/video.mp4"}'
+            '*/}.toString().slice(15,-3);</script>'
+        )
+        found = pv.find_embedded_videos(html, "https://pruffme.com/landing/u1/tmp1")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["title"], "Вебинар")
+        self.assertTrue(found[0]["url"].endswith("/video.mp4"))
+        self.assertNotIn("\\", found[0]["url"])
+
+    def test_pruffme_preview_is_not_a_video(self) -> None:
+        html = (
+            '<img src="https://video.pruffme.com/user/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'
+            'video/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/thumbs/preview.jpg">'
+        )
+        self.assertEqual(_urls(html), [])
+
     def test_getcourse_host_without_player_is_not_a_video(self) -> None:
         html = '<a href="https://vh-api-1-de.gceuproxy.com/health">cdn</a>'
         self.assertEqual(_urls(html), [])

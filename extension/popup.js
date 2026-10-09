@@ -104,10 +104,11 @@ function snapshotInPage() {
   walk(document, 0);
 
   let textUrls = [];
+  let html = "";
   const href = location.href || "";
   const direct = /youtube\.com\/watch|youtu\.be\/|youtube\.com\/shorts|youtube\.com\/embed|\/video|rutube\.|vimeo\.|vk\.com\/video|vk\.ru\/video|vkvideo\.ru/i.test(href);
   if (!direct && document.documentElement) {
-    const html = document.documentElement.innerHTML.slice(0, 350000);
+    html = document.documentElement.innerHTML.slice(0, 350000);
     const re = /https?:\/\/[^\s"'<>]{10,1200}/gi;
     let match;
     while ((match = re.exec(html)) && textUrls.length < 30) {
@@ -124,6 +125,10 @@ function snapshotInPage() {
     links: links,
     textUrls: textUrls,
     jsonLd: jsonLdUrls(),
+    mediaJson: (function () {
+      const found = html.match(/embedded_media_content\s*=\s*function\s*\(\)\s*\{\s*\/\*([\s\S]*?)\*\//);
+      return found ? found[1] : "";
+    })(),
   };
 }
 
@@ -232,6 +237,7 @@ async function videosFromTab() {
     links: [],
     textUrls: [],
     jsonLd: [],
+    mediaJson: "",
   };
   if (tab.id !== undefined && !/^(chrome|edge|about|browser|devtools|view-source):/i.test(url)) {
     try {
@@ -249,6 +255,7 @@ async function videosFromTab() {
         snapshot.links = got.links || [];
         snapshot.textUrls = got.textUrls || [];
         snapshot.jsonLd = got.jsonLd || [];
+        snapshot.mediaJson = got.mediaJson || "";
       }
     } catch (err) {
       if (!globalThis.KachalkaScan.isVideoUrl(snapshot.href)) throw err;
