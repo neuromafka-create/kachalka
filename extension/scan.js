@@ -144,7 +144,29 @@
     if (hostIs(host, "tiktok.com")) return path.indexOf("/video/") !== -1;
     if (hostIs(host, "twitch.tv")) return host.startsWith("player.") || path.indexOf("/videos/") !== -1;
     if (/\/sign-player\/?$/.test(path) && /[?&]json=/.test(parsed.search || "")) return true;
+    if (kinescopeId(url)) return true;
     return false;
+  }
+
+  function kinescopeId(url) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (_err) {
+      return "";
+    }
+    const host = hostOf(url);
+    if (host !== "kinescope.io" && host !== "www.kinescope.io") return "";
+    const parts = (parsed.pathname || "").split("/").filter(Boolean);
+    let id = "";
+    if (parts[0] && parts[0].toLowerCase() === "embed" && parts.length === 2) id = parts[1];
+    else if (parts.length === 1) id = parts[0];
+    else return "";
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      return id.toLowerCase();
+    }
+    if (/^[0-9A-Za-z]{10,}$/.test(id)) return id;
+    return "";
   }
 
   function getcourseHash(url) {
@@ -217,6 +239,8 @@
     }
     const gc = getcourseHash(url);
     if (gc) return "gc:" + gc;
+    const ks = kinescopeId(url);
+    if (ks) return "ks:" + ks;
     if (mediaExt(path)) return "file:" + host + path;
     return url.split("#")[0];
   }
@@ -247,6 +271,7 @@
     if (hostIs(host, "twitch.tv")) return "Twitch";
     if (hostIs(host, "tiktok.com")) return "TikTok";
     if (/\/sign-player\/?$/.test(new URL(url).pathname || "")) return "GetCourse";
+    if (kinescopeId(url)) return "Kinescope";
     if (mediaExt(host ? new URL(url).pathname : "")) return "Файл на странице";
     return host || "Видео";
   }

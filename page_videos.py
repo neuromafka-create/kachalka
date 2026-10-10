@@ -112,6 +112,12 @@ _EMBED_RES = (
         r"(?:\?[^\"'\s<>]{0,400})?",
         re.I,
     ),
+    # Плеер Kinescope: школы вставляют его и на свою страницу, и внутрь урока.
+    re.compile(
+        r"https?://(?:www\.)?kinescope\.io/embed/"
+        r"(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9A-Za-z]{10,})/?",
+        re.I,
+    ),
 )
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -205,6 +211,31 @@ def _add_pruffme(html: str, page_url: str, collector: "_Collector") -> None:
         collector.add(url, str(media.get("name") or ""), "file", page_url)
 
 
+_KINESCOPE_ID = re.compile(
+    r"^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9A-Za-z]{10,})$",
+    re.I,
+)
+
+
+def _kinescope_id(url: str) -> str:
+    """Короткий адрес ролика или embed. Скрипт плеера и постер сюда не входят."""
+    host = _host(url)
+    if host not in ("kinescope.io", "www.kinescope.io"):
+        return ""
+    parts = [part for part in (urlparse(url).path or "").split("/") if part]
+    if len(parts) == 2 and parts[0].lower() == "embed":
+        candidate = parts[1]
+    elif len(parts) == 1:
+        candidate = parts[0]
+    else:
+        return ""
+    if not _KINESCOPE_ID.fullmatch(candidate):
+        return ""
+    if re.fullmatch(r"[0-9a-f-]{36}", candidate, re.I):
+        return candidate.lower()
+    return candidate
+
+
 def _getcourse_player(url: str) -> bool:
     """Подписанный плеер GetCourse. Сам json= обязателен, иначе это не ролик."""
     try:
@@ -291,6 +322,8 @@ def is_video_url(url: str) -> bool:
         return host.startswith("player.") or "/videos/" in path
     if _getcourse_player(url):
         return True
+    if _kinescope_id(url):
+        return True
     return False
 
 
@@ -335,6 +368,9 @@ def canonical_key(url: str) -> str:
     video_hash = _getcourse_hash(url)
     if video_hash:
         return "gc:" + video_hash
+    kinescope_id = _kinescope_id(url)
+    if kinescope_id:
+        return "ks:" + kinescope_id
     if _media_ext(path):
         return "file:" + host + path
     return url.split("#", 1)[0]
@@ -381,6 +417,8 @@ def service_name(url: str) -> str:
         return "TikTok"
     if _getcourse_player(url):
         return "GetCourse"
+    if _kinescope_id(url):
+        return "Kinescope"
     if _media_ext(urlparse(url).path):
         return "Файл на странице"
     return host or "Видео"

@@ -3,6 +3,7 @@
 # Тот же формат и ffmpeg, что в kachalka.py; прогресс через progress hooks.
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -143,6 +144,91 @@ def _patch_yt_dlp_getcourse_player() -> None:
 
 
 _patch_yt_dlp_getcourse_player()
+
+# Kinescope нет в yt-dlp 2026.07.04. Школы вставляют embed на свою страницу.
+_KINESCOPE_URL_RE = (
+    r"https?://(?:www\.)?kinescope\.io/(?:embed/)?"
+    r"(?P<id>[0-9A-Za-z]{10,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/?(?:[?#]|$)"
+)
+
+
+def _patch_yt_dlp_kinescope() -> None:
+    """Узнать embed Kinescope и взять его открытый плейлист, не качая ролик заранее."""
+    try:
+        from yt_dlp.extractor.common import InfoExtractor
+        from yt_dlp.extractor import import_extractors
+        from yt_dlp.globals import extractors as extractors_ctx
+        from yt_dlp.utils import ExtractorError
+    except ImportError:
+        return
+    import_extractors()
+    if "KinescopeIE" in extractors_ctx.value:
+        return
+
+    class KinescopeIE(InfoExtractor):
+        IE_NAME = "kinescope"
+        _VALID_URL = _KINESCOPE_URL_RE
+
+        def _real_extract(self, url: str) -> dict[str, Any]:
+            video_id = self._match_id(url)
+            embed = f"https://kinescope.io/embed/{video_id}"
+            webpage = self._download_webpage(
+                embed,
+                video_id,
+                headers={"Referer": "https://kinescope.io/"},
+            )
+            found = re.search(
+                r"var\s+playerOptions\s*=\s*(\{.*?\})\s*;\s*(?:var\s|function\s)",
+                webpage,
+                re.S,
+            )
+            if not found:
+                raise ExtractorError("video unavailable", expected=True, video_id=video_id)
+            try:
+                options = json.loads(found.group(1))
+            except json.JSONDecodeError as exc:
+                raise ExtractorError("video unavailable", expected=True, video_id=video_id) from exc
+            playlist = options.get("playlist") if isinstance(options, dict) else None
+            item = playlist[0] if isinstance(playlist, list) and playlist else None
+            if not isinstance(item, dict):
+                raise ExtractorError("private video", expected=True, video_id=video_id)
+            sources = item.get("sources") if isinstance(item.get("sources"), dict) else {}
+            hls = sources.get("hls") if isinstance(sources.get("hls"), dict) else {}
+            playlist_url = str(hls.get("src") or "").strip()
+            if not playlist_url.startswith("https://"):
+                raise ExtractorError("private video", expected=True, video_id=video_id)
+            file_id = str(item.get("id") or video_id)
+            formats = self._extract_m3u8_formats(
+                playlist_url,
+                file_id,
+                "mp4",
+                m3u8_id="hls",
+                headers={"Referer": embed},
+            )
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+            duration = meta.get("duration")
+            return {
+                "id": file_id,
+                "title": str(item.get("title") or video_id),
+                "duration": duration if isinstance(duration, int) else None,
+                "thumbnail": item.get("posterInPreview") or None,
+                "formats": formats,
+            }
+
+    current = extractors_ctx.value
+    rebuilt: dict[str, Any] = {}
+    for name, ie in current.items():
+        if name == "GenericIE":
+            rebuilt["KinescopeIE"] = KinescopeIE
+        rebuilt[name] = ie
+    if "KinescopeIE" not in rebuilt:
+        rebuilt["KinescopeIE"] = KinescopeIE
+    current.clear()
+    current.update(rebuilt)
+
+
+_patch_yt_dlp_kinescope()
 
 
 def _yandex_user_data_dir() -> str:

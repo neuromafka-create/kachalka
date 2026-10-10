@@ -126,4 +126,15 @@ assert.strictEqual(
 );
 assert.strictEqual(pruffme[0].title, "Вебинар про сайты");
 
+const kinescope = scan.collectVideos({
+  href: "https://school.example/lesson",
+  title: "Урок",
+  iframes: [{ src: "https://kinescope.io/embed/abcdefghij1234", title: "" }],
+});
+assert.strictEqual(kinescope.length, 1);
+assert.strictEqual(kinescope[0].url, "https://kinescope.io/embed/abcdefghij1234");
+assert.strictEqual(kinescope[0].title, "Kinescope");
+assert.strictEqual(scan.isVideoUrl("https://kinescope.io/"), false);
+assert.strictEqual(scan.isVideoUrl("https://player.kinescope.io/v2/player.js"), false);
+
 console.log("extension scan ok");

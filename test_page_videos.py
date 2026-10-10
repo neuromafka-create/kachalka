@@ -183,6 +183,20 @@ class FindEmbeddedTests(unittest.TestCase):
         )
         self.assertEqual(_urls(html), [])
 
+    def test_kinescope_embed_on_a_lesson_page(self) -> None:
+        html = (
+            "<iframe src=\"https://kinescope.io/embed/abcdefghij1234\"></iframe>"
+            "<img src=\"https://edge.kinescopecdn.net/poster.jpg\">"
+        )
+        found = pv.find_embedded_videos(html, "https://school.example/lesson")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["url"], "https://kinescope.io/embed/abcdefghij1234")
+        self.assertEqual(found[0]["title"], "Kinescope")
+
+    def test_kinescope_home_is_not_a_video(self) -> None:
+        self.assertFalse(pv.is_video_url("https://kinescope.io/"))
+        self.assertFalse(pv.is_video_url("https://player.kinescope.io/v2/player.js"))
+
     def test_getcourse_host_without_player_is_not_a_video(self) -> None:
         html = '<a href="https://vh-api-1-de.gceuproxy.com/health">cdn</a>'
         self.assertEqual(_urls(html), [])
@@ -201,6 +215,20 @@ class GetCourseExtractorTests(unittest.TestCase):
         self.assertTrue(GetCourseRuPlayerIE.suitable(player))
         self.assertTrue(GetCourseRuPlayerIE.suitable(classic))
         self.assertFalse(GetCourseRuPlayerIE.suitable("https://vasilinfo.ru/vkshopszap"))
+
+    def test_ytdlp_accepts_kinescope_embed(self) -> None:
+        import app  # noqa: F401
+        from yt_dlp.extractor import get_info_extractor
+
+        kinescope = get_info_extractor("Kinescope")
+        self.assertTrue(kinescope.suitable("https://kinescope.io/embed/abcdefghij1234"))
+        self.assertTrue(
+            kinescope.suitable(
+                "https://kinescope.io/embed/7f8970d0-d3d0-4e72-a7d2-5e83c2b8c1a3"
+            )
+        )
+        self.assertFalse(kinescope.suitable("https://school.example/lesson"))
+        self.assertFalse(kinescope.suitable("https://kinescope.io/"))
 
 
 class DirectUrlTests(unittest.TestCase):
