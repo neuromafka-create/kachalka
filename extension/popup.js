@@ -106,7 +106,7 @@ function snapshotInPage() {
   let textUrls = [];
   let html = "";
   const href = location.href || "";
-  const direct = /youtube\.com\/watch|youtu\.be\/|youtube\.com\/shorts|youtube\.com\/embed|\/video|rutube\.|vimeo\.|vk\.com\/video|vk\.ru\/video|vkvideo\.ru/i.test(href);
+  const direct = /youtube\.com\/watch|youtu\.be\/|youtube\.com\/shorts|youtube\.com\/embed|\/video|rutube\.|vimeo\.|vk\.com\/video|vk\.ru\/video|vkvideo\.ru|hackertube\.org\/(?:#\/)?watch\/[A-Za-z0-9_-]{11}/i.test(href);
   if (!direct && document.documentElement) {
     html = document.documentElement.innerHTML.slice(0, 350000);
     const re = /https?:\/\/[^\s"'<>]{10,1200}/gi;

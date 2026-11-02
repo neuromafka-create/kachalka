@@ -86,6 +86,13 @@ def _normalize_url(url: str) -> str:
             if list_id:
                 base += f"?list={list_id}"
             return base
+    try:
+        import page_videos
+    except ImportError:
+        return s
+    vid = page_videos._hackertube_id(s)
+    if vid:
+        return "https://www.youtube.com/watch?v=" + vid
     return s
 
 

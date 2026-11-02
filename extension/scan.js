@@ -145,7 +145,29 @@
     if (hostIs(host, "twitch.tv")) return host.startsWith("player.") || path.indexOf("/videos/") !== -1;
     if (/\/sign-player\/?$/.test(path) && /[?&]json=/.test(parsed.search || "")) return true;
     if (kinescopeId(url)) return true;
+    if (hackertubeId(url)) return true;
     return false;
+  }
+
+  function hackertubeId(url) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (_err) {
+      return "";
+    }
+    const host = hostOf(url);
+    if (host !== "hackertube.org" && host !== "www.hackertube.org") return "";
+    const path = (parsed.pathname || "").replace(/\/+$/, "");
+    const parts = path.split("/").filter(Boolean);
+    let candidate = "";
+    if (parts.length === 2 && parts[0].toLowerCase() === "watch") candidate = parts[1];
+    else if (!path) {
+      const frag = (parsed.hash || "").replace(/^#/, "").split("?")[0].replace(/^\/+|\/+$/g, "");
+      const fparts = frag.split("/").filter(Boolean);
+      if (fparts.length === 2 && fparts[0].toLowerCase() === "watch") candidate = fparts[1];
+    }
+    return /^[A-Za-z0-9_-]{11}$/.test(candidate) ? candidate : "";
   }
 
   function kinescopeId(url) {
@@ -206,6 +228,8 @@
     const host = hostOf(url);
     const path = parsed.pathname || "";
     const secret = secretSuffix(url);
+    const lecture = hackertubeId(url);
+    if (lecture) return "yt:" + lecture;
     if (host === "youtu.be" || host.endsWith(".youtu.be")) {
       const vid = path.replace(/^\/+|\/+$/g, "").split("/")[0];
       if (/^[\w-]{6,}$/.test(vid)) return "yt:" + vid + secret;
@@ -246,6 +270,8 @@
   }
 
   function downloadUrl(url) {
+    const lecture = hackertubeId(url);
+    if (lecture) return "https://www.youtube.com/watch?v=" + lecture;
     const clean = String(url || "").split("#")[0];
     if (!clean) return "";
     if (hasSecret(clean)) return clean;
@@ -261,7 +287,7 @@
 
   function serviceName(url) {
     const host = hostOf(url);
-    if (host.indexOf("youtu") !== -1) return "YouTube";
+    if (host.indexOf("youtu") !== -1 || hackertubeId(url)) return "YouTube";
     if (hostIs(host, "vk.com") || hostIs(host, "vk.ru") || hostIs(host, "vkvideo.ru")) return "ВК";
     if (hostIs(host, "rutube.ru")) return "Rutube";
     if (hostIs(host, "vimeo.com")) return "Vimeo";

@@ -137,4 +137,25 @@ assert.strictEqual(kinescope[0].title, "Kinescope");
 assert.strictEqual(scan.isVideoUrl("https://kinescope.io/"), false);
 assert.strictEqual(scan.isVideoUrl("https://player.kinescope.io/v2/player.js"), false);
 
+const hackertube = scan.collectVideos({
+  href: "https://hackertube.org/watch/NOAgplgTxfc",
+  title: "Lecture - HackerTube",
+  iframes: [],
+  links: [{ href: "https://hackertube.org/watch/XXXXXXXXXXX", title: "Другая" }],
+  textUrls: [
+    "https://www.youtube.com/watch?v=${d.vid}",
+    "https://www.youtube-nocookie.com/embed/${d.vid}",
+  ],
+});
+assert.strictEqual(hackertube.length, 1);
+assert.strictEqual(hackertube[0].url, "https://www.youtube.com/watch?v=NOAgplgTxfc");
+assert.strictEqual(
+  scan.downloadUrl("https://www.hackertube.org/#/watch/NOAgplgTxfc"),
+  "https://www.youtube.com/watch?v=NOAgplgTxfc"
+);
+assert.strictEqual(scan.isVideoUrl("https://hackertube.org/"), false);
+assert.strictEqual(scan.isVideoUrl("https://hackertube.org/search/depression"), false);
+assert.strictEqual(scan.isVideoUrl("https://hackertube.org/playlists"), false);
+assert.strictEqual(scan.isVideoUrl("https://hackertube.org/watch/short"), false);
+
 console.log("extension scan ok");

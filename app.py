@@ -6,16 +6,23 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
+import webbrowser
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 import yt_dlp
+from yt_dlp.downloader.http import HttpFD
+from yt_dlp.networking import Request
+from yt_dlp.networking.exceptions import HTTPError, TransportError
+from yt_dlp.utils import ContentTooShortError, DownloadError, parse_http_range
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -53,6 +60,12 @@ def _configure_ssl_certs() -> None:
 
 _configure_ssl_certs()
 
+
+# Номер в окне, в установщике и в README должен совпадать с этой строкой.
+APP_VERSION = "1.3.9"
+_UPDATE_REPO = "neuromafka-create/kachalka"
+_UPDATE_API = f"https://api.github.com/repos/{_UPDATE_REPO}/releases/latest"
+_RELEASE_PREFIX = f"/{_UPDATE_REPO}/releases"
 
 # С июля 2026 VK рекомендует vk.ru вместо vk.com («быстрее и надёжнее»).
 # Старые ссылки .com и vkvideo.ru по-прежнему принимаем.
@@ -208,10 +221,14 @@ def _patch_yt_dlp_kinescope() -> None:
             )
             meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
             duration = meta.get("duration")
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+                duration_value: int | None = None
+            else:
+                duration_value = int(duration)
             return {
                 "id": file_id,
                 "title": str(item.get("title") or video_id),
-                "duration": duration if isinstance(duration, int) else None,
+                "duration": duration_value,
                 "thumbnail": item.get("posterInPreview") or None,
                 "formats": formats,
             }
@@ -492,6 +509,430 @@ def _youtube_cdn_blocked(exc: BaseException) -> bool:
     return "http error 403" in low or "403: forbidden" in low
 
 
+def _youtube_needs_fallback(exc: BaseException) -> bool:
+    """Отказ, после которого имеет смысл взять цельный файл клиента android.
+
+    YouTube меняет причину: то 403 посреди файла, то «подтверди, что не робот»,
+    то поток без обычной ссылки. Ролик при этом может быть открытым.
+    """
+    low = _exc_search_text(exc).lower()
+    # «Подтверди возраст» — ролик закрыт по возрасту, запасной клиент его не откроет.
+    if "your age" in low:
+        return False
+    return any(
+        piece in low
+        for piece in (
+            "http error 403",
+            "403: forbidden",
+            "sign in to confirm",
+            "requested format is not available",
+            "only images are available",
+            "sabr",
+            "nsig extraction failed",
+            "no supported javascript runtime",
+        )
+    )
+
+
+def _runtime_path(name: str) -> str | None:
+    """Путь к движку JavaScript. Окно программы не всегда видит PATH консоли."""
+    found = shutil.which(name)
+    if found:
+        return found
+    if name == "node":
+        roots = (
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        )
+        for root in roots:
+            candidate = Path(root) / "nodejs" / "node.exe"
+            if candidate.is_file():
+                return str(candidate)
+    if name == "bun":
+        candidate = Path.home() / ".bun" / "bin" / "bun.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _js_runtimes() -> dict[str, dict[str, str]]:
+    """Движки, которыми yt-dlp считает подпись YouTube. Берём только то, что есть в системе."""
+    found: dict[str, dict[str, str]] = {}
+    for name in ("deno", "node", "bun"):
+        path = _runtime_path(name)
+        if path:
+            found[name] = {"path": path}
+    return found
+
+
+def _apply_js_solver(opts: dict[str, Any]) -> None:
+    """Подпись YouTube считается движком с компьютера и официальным скриптом yt-dlp."""
+    runtimes = _js_runtimes()
+    if not runtimes:
+        return
+    opts["js_runtimes"] = runtimes
+    opts["remote_components"] = ["ejs:github"]
+
+
+# Мобильная страница отдаёт цельный mp4. Обычный клиент yt-dlp ссылку даёт, а файл режет 403.
+# Встроенный плеер — запасной: на части роликов он открывается, когда мобильная страница не открылась.
+_YOUTUBE_PLAYER_CLIENTS = ["mweb"]
+_YOUTUBE_FALLBACK_CLIENTS = ["web_embedded"]
+
+
+def _youtube_retry_plan(
+    cookie_file: Path | None,
+    saved: list[Path],
+) -> list[tuple[Path | None, list[str]]]:
+    """Повтор, если мобильная страница не отдала файл.
+
+    Сначала сохранённый вход той же страницей, затем встроенный плеер.
+    """
+    plans: list[tuple[Path | None, list[str]]] = []
+    if cookie_file is None:
+        for jar in saved[:2]:
+            plans.append((jar, list(_YOUTUBE_PLAYER_CLIENTS)))
+        jars: list[Path | None] = list(saved[:2]) or [None]
+    else:
+        jars = [cookie_file]
+    for jar in jars:
+        plans.append((jar, list(_YOUTUBE_FALLBACK_CLIENTS)))
+    return plans
+
+
+# Одна ссылка googlevideo принимает первые закрытые куски, а следующий кусок той же
+# ссылки отвечает 403. Свежая ссылка на тот же диапазон проходит. Открытый конец
+# Range и неровное начало — нет, поэтому куски ровно по 10 МиБ, без укорочения.
+_YOUTUBE_MEDIA_CHUNK = 10 << 20
+_YOUTUBE_REFRESH_PAUSE = 1.0
+
+
+def _is_googlevideo_host(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host.endswith(".googlevideo.com") or host == "googlevideo.com"
+
+
+def _needs_fresh_googlevideo_url(info: dict[str, Any]) -> bool:
+    """Цельный файл с googlevideo, не нарезка из фрагментов."""
+    if info.get("fragments"):
+        return False
+    return _is_googlevideo_host(str(info.get("url") or ""))
+
+
+def _youtube_closed_ranges(total: int, chunk: int) -> list[tuple[int, int]]:
+    """Закрытые диапазоны [start, end], которые подряд покрывают total байт."""
+    if total <= 0 or chunk <= 0:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    while start < total:
+        end = min(start + chunk, total) - 1
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
+
+
+def _youtube_refresh_cap(total: int | None, chunk: int | None = None) -> int:
+    """Сколько раз можно взять новую ссылку, пока ролик не собран."""
+    step = chunk or _YOUTUBE_MEDIA_CHUNK
+    if not total or total < 1 or step < 1:
+        return 24
+    pieces = (total + step - 1) // step
+    return min(80, max(24, pieces + 4))
+
+
+def _youtube_media_url(info: dict[str, Any] | None, format_id: str) -> str | None:
+    """Ссылка того же формата после повторного разбора страницы."""
+    if not info or not format_id:
+        return None
+    candidates: list[dict[str, Any]] = []
+    if str(info.get("format_id") or "") == format_id:
+        candidates.append(info)
+    for fmt in list(info.get("formats") or []) + list(info.get("requested_formats") or []):
+        if str(fmt.get("format_id") or "") == format_id:
+            candidates.append(fmt)
+    for fmt in candidates:
+        url = str(fmt.get("url") or "")
+        if _is_googlevideo_host(url):
+            return url
+    return None
+
+
+def _response_status(resp: Any) -> int:
+    raw = getattr(resp, "status", None)
+    if raw is None:
+        raw = getattr(resp, "code", None)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _response_header(headers: Any, name: str) -> str | None:
+    if not headers:
+        return None
+    value = headers.get(name)
+    if value is None:
+        value = headers.get(name.lower())
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    return str(value)
+
+
+class _StaleGooglevideo(Exception):
+    """Текущая ссылка этот кусок уже не отдаёт."""
+
+    def __init__(self, exc: BaseException | None = None):
+        super().__init__(str(exc) if exc else "stale media url")
+        self.exc = exc
+
+
+class _GooglevideoFD(HttpFD):
+    """Качает googlevideo закрытыми кусками и берёт новую ссылку, если кусок режут."""
+
+    def real_download(self, filename, info_dict):
+        url = str(info_dict.get("url") or "")
+        if not _needs_fresh_googlevideo_url(info_dict):
+            return super().real_download(filename, info_dict)
+
+        total = int(info_dict.get("filesize") or info_dict.get("filesize_approx") or 0)
+        headers = dict(info_dict.get("http_headers") or {})
+        headers.pop("Range", None)
+        headers.pop("range", None)
+        headers["Accept-Encoding"] = "identity"
+
+        part = self.temp_name(filename)
+        if part != filename and os.path.isfile(part):
+            os.remove(part)
+
+        cap = _youtube_refresh_cap(total or None)
+        chunk = _YOUTUBE_MEDIA_CHUNK
+        downloaded = 0
+        refreshes = 0
+        started = time.time()
+        stream, part = self.sanitize_open(part, "wb")
+        try:
+            while total <= 0 or downloaded < total:
+                start = downloaded
+                end = start + chunk - 1
+                if total > 0:
+                    end = min(end, total - 1)
+                if end < start:
+                    break
+                try:
+                    got, seen_total = self._read_closed_range(
+                        url,
+                        headers,
+                        start,
+                        end,
+                        stream,
+                        info_dict,
+                        total,
+                        started,
+                        filename,
+                    )
+                except _StaleGooglevideo as stale:
+                    stream.seek(start)
+                    stream.truncate(start)
+                    downloaded = start
+                    self._report_media(start, total, started, filename, info_dict)
+                    if start == 0 or refreshes >= cap:
+                        self._raise_media_failure(stale)
+                    new_url = self._fresh_media_url(info_dict)
+                    refreshes += 1
+                    if _YOUTUBE_REFRESH_PAUSE:
+                        time.sleep(_YOUTUBE_REFRESH_PAUSE)
+                    if not new_url:
+                        self._raise_media_failure(stale)
+                    url = new_url
+                    continue
+                if seen_total and seen_total > 0:
+                    total = seen_total
+                downloaded += got
+                if got <= 0:
+                    break
+        finally:
+            stream.close()
+
+        if total > 0 and downloaded < total:
+            raise ContentTooShortError(downloaded, total)
+        if part != filename:
+            self.try_rename(part, filename)
+        self._hook_progress(
+            {
+                "status": "finished",
+                "downloaded_bytes": downloaded,
+                "total_bytes": downloaded,
+                "filename": filename,
+                "elapsed": time.time() - started,
+            },
+            info_dict,
+        )
+        return True
+
+    def _raise_media_failure(self, stale: _StaleGooglevideo) -> None:
+        if stale.exc is not None:
+            raise stale.exc
+        raise DownloadError("HTTP Error 403: Forbidden")
+
+    def _fresh_media_url(self, info_dict: dict[str, Any]) -> str | None:
+        webpage = info_dict.get("webpage_url") or info_dict.get("original_url")
+        format_id = str(info_dict.get("format_id") or "")
+        if not webpage or not format_id:
+            return None
+        fresh = self.ydl.extract_info(webpage, download=False)
+        return _youtube_media_url(fresh, format_id)
+
+    def _report_media(
+        self,
+        downloaded: int,
+        total: int,
+        started: float,
+        filename: str,
+        info_dict: dict[str, Any],
+    ) -> None:
+        elapsed = time.time() - started
+        speed = None
+        eta = None
+        if downloaded > 0 and elapsed >= 0.001:
+            speed = downloaded / elapsed
+            if total > downloaded and speed:
+                eta = int((total - downloaded) / speed)
+        status: dict[str, Any] = {
+            "status": "downloading",
+            "downloaded_bytes": downloaded,
+            "filename": filename,
+            "tmpfilename": filename,
+            "elapsed": elapsed,
+            "speed": speed,
+            "eta": eta,
+        }
+        if total > 0:
+            status["total_bytes"] = total
+        self._hook_progress(status, info_dict)
+
+    def _open_range(self, request: Request) -> Any:
+        last: BaseException | None = None
+        for _ in range(3):
+            try:
+                return self.ydl.urlopen(request)
+            except TransportError as err:
+                last = err
+        if last is not None:
+            raise last
+        raise TransportError("media request failed")
+
+    def _read_closed_range(
+        self,
+        url: str,
+        headers: dict[str, Any],
+        start: int,
+        end: int,
+        stream: Any,
+        info_dict: dict[str, Any],
+        total: int,
+        started: float,
+        filename: str,
+    ) -> tuple[int, int | None]:
+        request = Request(url, headers=headers)
+        request.headers["Range"] = f"bytes={start}-{end}"
+        resp = None
+        try:
+            try:
+                resp = self._open_range(request)
+            except HTTPError as err:
+                if err.status == 416 and start > 0:
+                    return 0, start
+                if err.status == 403:
+                    raise _StaleGooglevideo(err) from err
+                raise
+            except TransportError as err:
+                # Обрыв посреди файла — та же судьба, что у 403: новая ссылка на этот кусок.
+                if start > 0:
+                    raise _StaleGooglevideo(err) from err
+                raise
+            status = _response_status(resp)
+            if status == 200 and start > 0:
+                raise _StaleGooglevideo()
+            if status not in (200, 206):
+                raise _StaleGooglevideo()
+            content_range = _response_header(resp.headers, "Content-Range")
+            cr_start, cr_end, cr_total = parse_http_range(content_range)
+            if status == 206 and cr_start is not None and cr_start != start:
+                raise _StaleGooglevideo()
+            want = end - start + 1
+            seen_total = cr_total if cr_total else None
+            if cr_end is not None and cr_start == start:
+                promised = cr_end - start + 1
+                if 0 < promised < want:
+                    want = promised
+            else:
+                length_raw = _response_header(resp.headers, "Content-Length")
+                try:
+                    length = int(length_raw) if length_raw else 0
+                except ValueError:
+                    length = 0
+                if status == 200 and 0 < length < want:
+                    want = length
+                    seen_total = start + length
+            wrote = 0
+            try:
+                while wrote < want:
+                    block = resp.read(min(256 * 1024, want - wrote))
+                    if not block:
+                        break
+                    stream.write(block)
+                    wrote += len(block)
+                    self._report_media(
+                        start + wrote,
+                        seen_total or total,
+                        started,
+                        filename,
+                        info_dict,
+                    )
+            except TransportError as err:
+                if start > 0 or wrote > 0:
+                    raise _StaleGooglevideo(err) from err
+                raise
+            if wrote != want:
+                raise _StaleGooglevideo()
+            return wrote, seen_total
+        finally:
+            if resp is not None:
+                resp.close()
+
+
+class _YoutubeSession(yt_dlp.YoutubeDL):
+    """Для файла YouTube подменяет загрузчик: оборванный кусок берётся новой ссылкой."""
+
+    def dl(self, name, info, subtitle=False, test=False):
+        if (
+            not subtitle
+            and not test
+            and name != "-"
+            and _needs_fresh_googlevideo_url(info)
+        ):
+            fd = _GooglevideoFD(self, self.params)
+            for ph in self._progress_hooks:
+                fd.add_progress_hook(ph)
+            new_info = self._copy_infodict(info)
+            if new_info.get("http_headers") is None:
+                new_info["http_headers"] = self._calc_headers(new_info)
+            return fd.download(name, new_info, subtitle)
+        return super().dl(name, info, subtitle=subtitle, test=test)
+
+
+def _ydl_for(url: str) -> type:
+    if _is_youtube_url(url):
+        return _YoutubeSession
+    return yt_dlp.YoutubeDL
+
+
 def _is_vk_url(url: str) -> bool:
     try:
         host = (urlparse(url).hostname or "").lower()
@@ -566,6 +1007,12 @@ def _normalize_url(url: str) -> str:
                 base += f"?list={list_id}"
             return base
 
+    # HackerTube показывает ролик YouTube только после клика по заглушке.
+    # yt-dlp такой сайт не знает: сразу подставляем обычную ссылку на ролик.
+    vid = page_videos._hackertube_id(s)
+    if vid:
+        return "https://www.youtube.com/watch?v=" + vid
+
     return s
 
 
@@ -610,6 +1057,17 @@ def _saved_browsers() -> list[str]:
         for browser in BROWSER_CHOICES
         if _saved_cookies_usable(_saved_browser_cookies_path(browser))
     ]
+
+
+def _page_cookie_files() -> list[str]:
+    """Уже сохранённый вход: ручной cookies.txt и копии браузеров."""
+    paths: list[str] = []
+    manual = _find_cookies_file()
+    if manual is not None:
+        paths.append(str(manual))
+    for browser in _saved_browsers():
+        paths.append(str(_saved_browser_cookies_path(browser)))
+    return paths
 
 
 def _store_cookie_jar(jar: Any, dest: Path) -> None:
@@ -756,9 +1214,28 @@ def _human_error(exc: BaseException, *, url: str = "") -> str:
                 "Качалка запомнит вход, и дальше браузер можно не закрывать. "
                 "Если сохранённый вход устарел, закрой браузер ещё один раз."
             )
+        if (
+            "sign in to confirm" in low
+            and "your age" not in low
+            and (_is_youtube_url(url) or "[youtube]" in low)
+        ):
+            return (
+                "YouTube не отдал файл: просит подтвердить, что это не робот. "
+                "Ролик может быть открытым. Войди в YouTube в Яндекс.Браузере, "
+                "закрой его полностью один раз и попробуй снова"
+            )
         return "Видео недоступно — оно закрыто, ограничено по региону или требует входа"
     if "not available in your region" in low or "недоступно в вашем регионе" in low:
         return "Видео недоступно в твоём регионе"
+    # «not available» ниже означает «удалено». У YouTube та же фраза бывает,
+    # когда открытый ролик не отдал обычный файл — её надо поймать раньше.
+    if "requested format is not available" in low and (
+        _is_youtube_url(url) or "[youtube]" in low
+    ):
+        return (
+            "YouTube не отдал обычный файл. Ролик может быть открытым — "
+            "так сайт режет скачивание. Попробуй ещё раз чуть позже"
+        )
     if (
         "video unavailable" in low
         or "not available" in low
@@ -978,6 +1455,7 @@ def _ydl_opts(
     cookies_browser: str | None = None,
     player_clients: list[str] | None = None,
     filename_stem: str | None = None,
+    for_youtube: bool = False,
 ) -> dict[str, Any]:
     """Опции yt-dlp: видео (mp4 + качество) или только звук (mp3)."""
     opts: dict[str, Any] = {
@@ -987,12 +1465,15 @@ def _ydl_opts(
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "http_headers": dict(_HTTP_HEADERS),
         # Чуть устойчивее к обрывам (VK/CDN)
         "retries": 10,
         "fragment_retries": 10,
         "extractor_retries": 3,
     }
+    # Чужой User-Agent на YouTube даёт 403 даже у открытого ролика.
+    # Для остальных сайтов оставляем обычный заголовок браузера.
+    if not for_youtube:
+        opts["http_headers"] = dict(_HTTP_HEADERS)
     # ffmpeg нужен и для склейки mp4, и для конвертации в mp3
     if (FFMPEG_BIN / "ffmpeg.exe").exists():
         opts["ffmpeg_location"] = str(FFMPEG_BIN)
@@ -1019,6 +1500,10 @@ def _ydl_opts(
         opts["format"] = FORMAT_BY_QUALITY.get(q, FORMAT_BY_QUALITY[QUALITY_BEST])
         opts["merge_output_format"] = "mp4"
 
+    _apply_js_solver(opts)
+
+    if for_youtube and not player_clients:
+        player_clients = list(_YOUTUBE_PLAYER_CLIENTS)
     if player_clients:
         # Значения extractor_args — всегда списки строк.
         # continuedl выключен: оборванный первый файл нельзя докачивать другим клиентом.
@@ -1139,6 +1624,7 @@ def _do_download(
             use_file: Path | None,
             use_browser: str | None,
             player_clients: list[str] | None = None,
+            fresh: bool = False,
         ) -> tuple[Any, Path]:
             opts = _ydl_opts(
                 out_dir,
@@ -1148,8 +1634,12 @@ def _do_download(
                 cookies_browser=use_browser,
                 player_clients=player_clients,
                 filename_stem=filename_stem,
+                for_youtube=_is_youtube_url(url),
             )
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            if fresh:
+                # Оборванный первый файл нельзя докачивать уже с другим входом.
+                opts["continuedl"] = False
+            with _ydl_for(url)(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 path = _final_path(ydl, info or {}, mode)
                 return info, path
@@ -1158,28 +1648,52 @@ def _do_download(
         try:
             info, path = _run(use_file=use_file, use_browser=None)
         except Exception as first_exc:  # noqa: BLE001
-            # YouTube: страница открытая, а файл по обычной ссылке CDN режет 403.
-            # Клиент android отдаёт цельный mp4 (часто 360p) без этого отказа.
-            if _is_youtube_url(url) and _youtube_cdn_blocked(first_exc):
-                with _lock:
-                    _state["warning"] = (
-                        (warning + " " if warning else "")
-                        + "YouTube не отдал полное качество, беру запасной файл…"
-                    ).strip()
-                info, path = _run(
-                    use_file=use_file,
-                    use_browser=None,
-                    player_clients=["android"],
+            # Мобильная страница иногда упирается в «не робот» или 403.
+            # Тогда пробуем сохранённый вход и встроенный плеер.
+            if _is_youtube_url(url) and _youtube_needs_fallback(first_exc):
+                saved = (
+                    []
+                    if use_file is not None
+                    else [Path(item) for item in _page_cookie_files()]
                 )
-                height = int((info or {}).get("height") or 0)
-                note = (
-                    f"Файл скачан в {height}p: более высокое качество YouTube сейчас не отдаёт."
-                    if height
-                    else "Файл скачан в запасном качестве: более высокое YouTube сейчас не отдаёт."
-                )
-                warning = f"{warning} {note}".strip() if warning else note
-                with _lock:
-                    _state["warning"] = warning
+                plans = _youtube_retry_plan(use_file, saved)
+                last_exc: BaseException = first_exc
+                opened = False
+                for jar, clients in plans:
+                    try:
+                        if jar is not None and use_file is None:
+                            retry_note = (
+                                "YouTube просит подтвердить, что это не робот. "
+                                "Пробую сохранённый вход…"
+                            )
+                        else:
+                            retry_note = "YouTube не отдал файл, пробую ещё раз…"
+                        with _lock:
+                            _state["warning"] = (
+                                (warning + " " if warning else "") + retry_note
+                            ).strip()
+                        info, path = _run(
+                            use_file=jar,
+                            use_browser=None,
+                            player_clients=clients,
+                            fresh=True,
+                        )
+                        notes: list[str] = []
+                        if jar is not None and use_file is None:
+                            notes.append("Сохранённый вход из браузера")
+                        if notes:
+                            warning = f"{warning} {' '.join(notes)}".strip()
+                            with _lock:
+                                _state["warning"] = warning
+                        opened = True
+                        break
+                    except Exception as retry_exc:  # noqa: BLE001
+                        last_exc = retry_exc
+                        if not _youtube_needs_fallback(retry_exc):
+                            raise
+                        continue
+                if not opened:
+                    raise last_exc
             # ВК: закрытое видео — авто-повтор с cookies. Сначала Яндекс.Браузер.
             elif (
                 _is_vk_url(url)
@@ -1219,11 +1733,51 @@ def _do_download(
                     if best_exc is first_exc:
                         raise best_exc
                     raise best_exc from first_exc
+            elif (
+                page_videos._kinescope_id(url)
+                and _needs_auth_retry(first_exc)
+                and use_file is None
+            ):
+                last_exc: BaseException = first_exc
+                opened = False
+                for cookie_path in _page_cookie_files():
+                    try:
+                        with _lock:
+                            _state["warning"] = (
+                                (warning + " " if warning else "")
+                                + "Ролик закрытый, пробую сохранённый вход…"
+                            ).strip()
+                        info, path = _run(use_file=Path(cookie_path), use_browser=None)
+                        note = "Сохранённый вход из браузера"
+                        warning = f"{warning} {note}".strip() if warning else note
+                        with _lock:
+                            _state["warning"] = warning
+                        opened = True
+                        break
+                    except Exception as retry_exc:  # noqa: BLE001
+                        last_exc = retry_exc
+                        continue
+                if not opened:
+                    raise last_exc
             else:
                 raise
 
         default_title = "Аудио" if mode == MODE_AUDIO else "Видео"
         title = (info or {}).get("title") or default_title
+        height = int((info or {}).get("height") or 0)
+        if (
+            mode == MODE_VIDEO
+            and _is_youtube_url(url)
+            and height
+            and height <= 360
+        ):
+            note = (
+                f"Файл скачан в {height}p: более высокое качество "
+                "YouTube сейчас не отдаёт."
+            )
+            warning = f"{warning} {note}".strip() if warning else note
+            with _lock:
+                _state["warning"] = warning
 
         with _lock:
             _state["status"] = "done"
@@ -1382,6 +1936,157 @@ class OpenFolderRequest(BaseModel):
     folder: str | None = None
 
 
+class OpenReleaseRequest(BaseModel):
+    url: str = ""
+
+
+def _version_parts(text: str) -> tuple[int, ...] | None:
+    """«v1.3.10» → (1, 3, 10). Пустая или нечисловая строка — не версия."""
+    raw = (text or "").strip()
+    if raw[:1] in ("v", "V"):
+        raw = raw[1:]
+    if not raw:
+        return None
+    parts: list[int] = []
+    for piece in raw.split("."):
+        digits = ""
+        for ch in piece:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            return None
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _version_is_newer(latest: str, current: str) -> bool:
+    new = _version_parts(latest)
+    old = _version_parts(current)
+    if not new or not old:
+        return False
+    width = max(len(new), len(old))
+    new = new + (0,) * (width - len(new))
+    old = old + (0,) * (width - len(old))
+    return new > old
+
+
+def _allowed_release_url(url: str) -> bool:
+    """Только страница релизов этого репозитория. Чужой адрес браузер не открывает."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host != "github.com":
+        return False
+    path = parsed.path or ""
+    return path == _RELEASE_PREFIX or path.startswith(_RELEASE_PREFIX + "/")
+
+
+def _setup_download_url(release: dict[str, Any]) -> str:
+    """Файл установщика из списка вложений. Архив расширения сюда не берём."""
+    tag = str(release.get("tag_name") or "").lstrip("vV")
+    found: list[tuple[int, str]] = []
+    assets = release.get("assets") or []
+    if not isinstance(assets, list):
+        return ""
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "")
+        url = str(asset.get("browser_download_url") or "")
+        low = name.lower()
+        if not low.startswith("kachalka-setup") or not low.endswith(".exe"):
+            continue
+        if not _allowed_release_url(url):
+            continue
+        score = 2 if tag and tag in name else 1
+        found.append((score, url))
+    if not found:
+        return ""
+    found.sort(key=lambda item: item[0], reverse=True)
+    return found[0][1]
+
+
+def _describe_release(release: dict[str, Any], current: str | None = None) -> dict[str, Any]:
+    here = current or APP_VERSION
+    tag = str(release.get("tag_name") or "")
+    if _version_parts(tag) is None:
+        return _update_unreachable(here)
+    page = str(release.get("html_url") or "")
+    if page and not _allowed_release_url(page):
+        page = ""
+    newer = _version_is_newer(tag, here)
+    download = _setup_download_url(release) if newer else ""
+    if not download and newer and page:
+        download = page
+    shown = tag[1:] if tag[:1] in ("v", "V") else tag
+    if newer:
+        message = f"Вышла версия {shown}. Сейчас стоит {here}."
+    else:
+        message = "Это последняя версия."
+    return {
+        "ok": True,
+        "current": here,
+        "latest": shown,
+        "update": newer,
+        "message": message,
+        "download_url": download,
+        "page_url": page,
+    }
+
+
+def _update_unreachable(current: str | None = None) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "current": current or APP_VERSION,
+        "latest": "",
+        "update": False,
+        "message": "Не удалось проверить обновления. Проверь интернет и попробуй ещё раз.",
+        "download_url": "",
+        "page_url": "",
+    }
+
+
+def fetch_latest_release(timeout: float = 8.0) -> dict[str, Any]:
+    """Свежий выпуск с GitHub. Черновики и предварительные версии сюда не попадают."""
+    request = urllib.request.Request(
+        _UPDATE_API,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"Kachalka/{APP_VERSION}",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read(1_000_000)
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("not a release")
+    return data
+
+
+def check_for_update() -> dict[str, Any]:
+    try:
+        release = fetch_latest_release()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return _update_unreachable()
+    return _describe_release(release)
+
+
+def open_release_page(url: str) -> dict[str, Any]:
+    if not _allowed_release_url(url):
+        return {"ok": False, "error": "Эту ссылку открывать нельзя."}
+    try:
+        webbrowser.open(url)
+    except OSError:
+        return {"ok": False, "error": "Не удалось открыть ссылку."}
+    return {"ok": True}
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC / "index.html")
@@ -1391,6 +2096,7 @@ def index() -> FileResponse:
 def get_config() -> dict[str, Any]:
     cookies = _find_cookies_file()
     return {
+        "version": APP_VERSION,
         "default_folder": str(DEFAULT_OUT),
         "default_folder_label": "Скачанное",
         "cookies_file": str(cookies) if cookies else None,
@@ -1398,6 +2104,18 @@ def get_config() -> dict[str, Any]:
         "browsers": list(BROWSER_CHOICES),
         "saved_browsers": _saved_browsers(),
     }
+
+
+@app.get("/api/updates")
+def updates() -> dict[str, Any]:
+    """Сравнить установленную версию со свежим выпуском на GitHub."""
+    return check_for_update()
+
+
+@app.post("/api/open-release")
+def open_release(req: OpenReleaseRequest) -> dict[str, Any]:
+    """Открыть страницу выпуска или установщик в браузере, не в окне Качалки."""
+    return open_release_page(req.url or "")
 
 
 def _browse_folder_dialog(initial: str) -> dict[str, Any]:
@@ -1499,7 +2217,13 @@ def browse_folder(req: BrowseFolderRequest | None = None) -> dict[str, Any]:
     return _browse_folder_dialog(str(initial))
 
 
-def _quiet_ydl_opts(*, browser: str | None, use_file: bool) -> dict[str, Any]:
+def _quiet_ydl_opts(
+    *,
+    browser: str | None,
+    use_file: bool,
+    cookie_path: Path | None = None,
+    for_youtube: bool = False,
+) -> dict[str, Any]:
     """Метаданные ролика без скачивания и без прогресса в окне."""
     opts: dict[str, Any] = {
         "quiet": True,
@@ -1509,11 +2233,19 @@ def _quiet_ydl_opts(*, browser: str | None, use_file: bool) -> dict[str, Any]:
         "socket_timeout": 20,
         "retries": 2,
         "extractor_retries": 1,
-        "http_headers": dict(_HTTP_HEADERS),
     }
+    if not for_youtube:
+        opts["http_headers"] = dict(_HTTP_HEADERS)
+    else:
+        opts["extractor_args"] = {
+            "youtube": {"player_client": list(_YOUTUBE_PLAYER_CLIENTS)}
+        }
+    _apply_js_solver(opts)
     if (FFMPEG_BIN / "ffmpeg.exe").exists():
         opts["ffmpeg_location"] = str(FFMPEG_BIN)
-    if use_file:
+    if cookie_path is not None and cookie_path.is_file():
+        opts["cookiefile"] = str(cookie_path)
+    elif use_file:
         cookies = _find_cookies_file()
         if cookies is not None:
             opts["cookiefile"] = str(cookies)
@@ -1523,8 +2255,21 @@ def _quiet_ydl_opts(*, browser: str | None, use_file: bool) -> dict[str, Any]:
     return opts
 
 
-def _extract_title(url: str, *, browser: str | None, use_file: bool) -> str:
-    with yt_dlp.YoutubeDL(_quiet_ydl_opts(browser=browser, use_file=use_file)) as ydl:
+def _extract_title(
+    url: str,
+    *,
+    browser: str | None,
+    use_file: bool,
+    cookie_path: Path | None = None,
+) -> str:
+    with yt_dlp.YoutubeDL(
+        _quiet_ydl_opts(
+            browser=browser,
+            use_file=use_file,
+            cookie_path=cookie_path,
+            for_youtube=_is_youtube_url(url),
+        )
+    ) as ydl:
         info = ydl.extract_info(url, download=False) or {}
     if info.get("_type") == "playlist":
         entries = [item for item in (info.get("entries") or []) if item]
@@ -1540,11 +2285,23 @@ def _lookup_title(url: str, browser: str | None) -> str:
     try:
         return _extract_title(url, browser=None, use_file=False)
     except Exception as exc:
-        if not _needs_auth_retry(exc):
+        if not (_needs_auth_retry(exc) or _youtube_needs_fallback(exc)):
             raise
-        if _find_cookies_file() is None and not browser:
-            raise
-        return _extract_title(url, browser=browser, use_file=True)
+        if _find_cookies_file() is not None or browser:
+            return _extract_title(url, browser=browser, use_file=True)
+        last_exc: BaseException = exc
+        for item in _page_cookie_files()[:2]:
+            try:
+                return _extract_title(
+                    url,
+                    browser=None,
+                    use_file=False,
+                    cookie_path=Path(item),
+                )
+            except Exception as retry_exc:  # noqa: BLE001
+                last_exc = retry_exc
+                continue
+        raise last_exc
 
 
 @app.post("/api/preview-name")
@@ -1768,6 +2525,9 @@ def history(
         pass
     files.sort(key=lambda x: x["mtime"], reverse=True)
     return {"files": files[:30], "folder": str(path)}
+
+
+page_videos.set_page_cookie_files(_page_cookie_files)
 
 
 if STATIC.is_dir():

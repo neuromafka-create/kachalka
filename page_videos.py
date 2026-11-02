@@ -10,8 +10,9 @@ from html import unescape
 from html.parser import HTMLParser
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
+from http.cookiejar import CookieJar, MozillaCookieJar
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 MAX_HTML_BYTES = 2_000_000
 MAX_VIDEOS = 12
@@ -126,6 +127,33 @@ _USER_AGENT = (
 )
 
 Fetch = Callable[[str], tuple[str, str, str]]
+_cookie_files_provider: Callable[[], list[str]] | None = None
+
+
+def set_page_cookie_files(provider: Callable[[], list[str]] | None) -> None:
+    """Откуда брать уже сохранённый вход. Сами cookies сюда не передаются."""
+    global _cookie_files_provider
+    _cookie_files_provider = provider
+
+
+def _cookie_files() -> list[str]:
+    if _cookie_files_provider is None:
+        return []
+    try:
+        raw = list(_cookie_files_provider())
+    except Exception:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        path = str(item or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        found.append(path)
+        if len(found) >= 8:
+            break
+    return found
 
 
 def _host(url: str) -> str:
@@ -270,6 +298,38 @@ def _getcourse_hash(url: str) -> str:
     return ""
 
 
+_YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_HACKERTUBE_HOSTS = ("hackertube.org", "www.hackertube.org")
+
+
+def _hackertube_id(url: str) -> str:
+    """Лекция HackerTube: id ролика YouTube лежит в /watch/<id>.
+
+    Iframe в #player появляется только после клика по заглушке, в HTML его нет.
+    Старые ссылки выглядели как /#/watch/<id>.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host not in _HACKERTUBE_HOSTS:
+        return ""
+    path = (parsed.path or "").rstrip("/")
+    parts = [unquote(part) for part in path.split("/") if part]
+    candidate = ""
+    if len(parts) == 2 and parts[0].lower() == "watch":
+        candidate = parts[1]
+    elif not path:
+        frag = unquote(parsed.fragment or "").split("?", 1)[0].strip("/")
+        fparts = [part for part in frag.split("/") if part]
+        if len(fparts) == 2 and fparts[0].lower() == "watch":
+            candidate = fparts[1]
+    if _YT_ID.fullmatch(candidate):
+        return candidate
+    return ""
+
+
 def is_video_url(url: str) -> bool:
     """Ссылка уже указывает на ролик или файл, а не на статью."""
     try:
@@ -324,6 +384,8 @@ def is_video_url(url: str) -> bool:
         return True
     if _kinescope_id(url):
         return True
+    if _hackertube_id(url):
+        return True
     return False
 
 
@@ -333,6 +395,9 @@ def canonical_key(url: str) -> str:
     host = _host(url)
     path = parsed.path or ""
     secret = _secret_suffix(parsed.query)
+    hackertube = _hackertube_id(url)
+    if hackertube:
+        return "yt:" + hackertube
     if host == "youtu.be" or host.endswith(".youtu.be"):
         vid = path.strip("/").split("/")[0]
         if re.fullmatch(r"[\w-]{6,}", vid):
@@ -378,6 +443,9 @@ def canonical_key(url: str) -> str:
 
 def download_url(url: str) -> str:
     """Адрес, который отдаём в yt-dlp. Секретные параметры не выкидываем."""
+    hackertube = _hackertube_id(url)
+    if hackertube:
+        return "https://www.youtube.com/watch?v=" + hackertube
     clean = url.split("#", 1)[0]
     if _has_secret(clean):
         return clean
@@ -397,7 +465,7 @@ def download_url(url: str) -> str:
 
 def service_name(url: str) -> str:
     host = _host(url)
-    if "youtu" in host:
+    if "youtu" in host or _hackertube_id(url):
         return "YouTube"
     if host.endswith(("vk.com", "vk.ru", "vkvideo.ru")):
         return "ВК"
@@ -676,22 +744,28 @@ def _decode(raw: bytes, content_type: str) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
-def _fetch_html(url: str) -> tuple[str, str, str]:
-    req = Request(
-        url,
-        headers={
-            "User-Agent": _USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
-        },
-    )
+def _request(url: str, *, data: bytes | None = None, referer: str = "") -> Request:
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
+    }
+    if referer:
+        headers["Referer"] = referer
+    if data is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        headers["X-Requested-With"] = "XMLHttpRequest"
+    return Request(url, data=data, headers=headers)
+
+
+def _opener_read(opener: Any, req: Request) -> tuple[str, bytes, str]:
     try:
-        with urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+        with opener.open(req, timeout=FETCH_TIMEOUT) as resp:
             final = resp.geturl()
             ctype = resp.headers.get("Content-Type", "") or ""
             raw = resp.read(MAX_HTML_BYTES)
     except HTTPError as exc:
-        final = exc.geturl() or url
+        final = exc.geturl() or req.full_url
         ctype = exc.headers.get("Content-Type", "") if exc.headers else ""
         try:
             raw = exc.read(MAX_HTML_BYTES)
@@ -701,7 +775,195 @@ def _fetch_html(url: str) -> tuple[str, str, str]:
         raise OSError(str(exc)) from exc
     if urlparse(final).scheme not in ("http", "https"):
         raise OSError("redirect left http")
+    return final, raw, ctype
+
+
+def _fetch_html(url: str, *, cookie_file: str = "") -> tuple[str, str, str]:
+    jar: CookieJar | None = None
+    if cookie_file:
+        stored = MozillaCookieJar(cookie_file)
+        try:
+            stored.load(ignore_discard=True, ignore_expires=True)
+        except OSError as exc:
+            raise OSError(str(exc)) from exc
+        jar = stored
+    opener = build_opener(HTTPCookieProcessor(jar))
+    final, raw, ctype = _opener_read(opener, _request(url))
     return final, _decode(raw, ctype), ctype
+
+
+_FORM_BLOCK = re.compile(r"<form\b([^>]*)>(.*?)</form>", re.I | re.S)
+_INPUT_TAG = re.compile(r"<input\b[^>]*>", re.I | re.S)
+_TAG_ATTR = re.compile(
+    r"""([:\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>]+))""",
+    re.I,
+)
+
+
+def _tag_attrs(tag: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for match in _TAG_ATTR.finditer(tag):
+        value = match.group(2)
+        if value is None:
+            value = match.group(3)
+        if value is None:
+            value = match.group(4) or ""
+        attrs[match.group(1).lower()] = value
+    return attrs
+
+
+def _window_value(html: str, name: str) -> str:
+    found = re.search(
+        rf"window\.{re.escape(name)}\s*=\s*(\"[^\"]*\"|-?\d+)",
+        html,
+    )
+    if not found:
+        return ""
+    raw = found.group(1)
+    if raw.startswith('"'):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return ""
+        return value if isinstance(value, str) else ""
+    return raw
+
+
+def _query_raw(url: str, key: str) -> str:
+    """Значение из ссылки. Плюс в телефоне остаётся плюсом, а не пробелом."""
+    for part in (urlparse(url).query or "").split("&"):
+        name, sep, value = part.partition("=")
+        if sep and unquote(name) == key:
+            return unquote(value).strip()
+    return ""
+
+
+def getcourse_gate_request(html: str, page_url: str) -> tuple[str, dict[str, str]] | None:
+    """Форма GetCourse, если почта и телефон уже стоят в ссылке.
+
+    Контактные данные не выдумываются: нет их в адресе — форму не отправляем.
+    """
+    page_host = _host(page_url)
+    email = _query_raw(page_url, "email")
+    phone = _query_raw(page_url, "phone")
+    if not page_host or not email or not phone:
+        return None
+    sign = _window_value(html, "requestSimpleSign")
+    token = _window_value(html, "csrfToken")
+    stamp = _window_value(html, "requestTime")
+    if not sign or not token or not stamp:
+        return None
+    for open_tag, inner in _FORM_BLOCK.findall(html or ""):
+        attrs = _tag_attrs("<form " + open_tag + ">")
+        action = urljoin(page_url, attrs.get("action") or "")
+        parsed = urlparse(action)
+        path = (parsed.path or "").rstrip("/")
+        if _host(action) != page_host:
+            continue
+        if not path.endswith("/pl/lite/block-public/process"):
+            continue
+        if "id=" not in (parsed.query or ""):
+            continue
+        fields: dict[str, str] = {}
+        email_name = ""
+        phone_name = ""
+        for tag in _INPUT_TAG.findall(inner):
+            field = _tag_attrs(tag)
+            name = field.get("name") or ""
+            if not name or name in fields:
+                continue
+            fields[name] = field.get("value") or ""
+            low = name.lower()
+            if low == "email" or low.endswith("[email]"):
+                email_name = name
+            elif low == "phone" or low.endswith("[phone]"):
+                phone_name = name
+        if not email_name or not phone_name:
+            continue
+        if not fields.get(email_name):
+            fields[email_name] = email
+        if not fields.get(phone_name):
+            fields[phone_name] = phone
+        fields["csrfToken"] = token
+        fields["requestTime"] = stamp
+        fields["requestSimpleSign"] = sign
+        return action, fields
+    return None
+
+
+def _same_site(url: str, page_url: str) -> bool:
+    host = _host(url)
+    return bool(host) and host == _host(page_url)
+
+
+def open_getcourse_recording(page_url: str) -> str:
+    """HTML записи после формы этой же страницы. Пусто, если формы нет."""
+    jar = CookieJar()
+    opener = build_opener(HTTPCookieProcessor(jar))
+    try:
+        final, raw, ctype = _opener_read(opener, _request(page_url))
+    except OSError:
+        return ""
+    html = _decode(raw, ctype)
+    if not _looks_like_html(html, ctype):
+        return ""
+    gate = getcourse_gate_request(html, page_url)
+    if gate is None:
+        gate = getcourse_gate_request(html, final)
+    if gate is None:
+        return ""
+    action, fields = gate
+    try:
+        _posted, body, post_type = _opener_read(
+            opener,
+            _request(action, data=urlencode(fields).encode(), referer=final or page_url),
+        )
+    except OSError:
+        return ""
+    try:
+        payload = json.loads(_decode(body, post_type) or "{}")
+    except json.JSONDecodeError:
+        return ""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return ""
+    redirect = str(data.get("redirectUrl") or "").strip()
+    if redirect:
+        target = urljoin(final or page_url, redirect)
+        if not _same_site(target, page_url):
+            return ""
+        try:
+            _landed, landed_raw, landed_type = _opener_read(
+                opener,
+                _request(target, referer=final or page_url),
+            )
+        except OSError:
+            return ""
+        landed = _decode(landed_raw, landed_type)
+        if _looks_like_html(landed, landed_type):
+            return landed
+    parts = data.get("preParts")
+    chunks: list[str] = []
+    if isinstance(parts, list):
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("html"), str):
+                chunks.append(part["html"])
+    return "\n".join(chunks)
+
+
+def _videos_with_saved_cookies(url: str) -> list[dict[str, str]]:
+    """Закрытая страница: тот же адрес, но с уже сохранённым входом."""
+    for path in _cookie_files():
+        try:
+            final, html, ctype = _fetch_html(url, cookie_file=path)
+        except OSError:
+            continue
+        if not _looks_like_html(html, ctype):
+            continue
+        videos = find_embedded_videos(html, final or url)
+        if videos:
+            return videos
+    return []
 
 
 def _looks_like_html(text: str, content_type: str) -> bool:
@@ -740,6 +1002,12 @@ def inspect_page(url: str, *, fetch: Fetch | None = None) -> dict[str, Any]:
             }
         return {"mode": "direct", "videos": [], "scanned": False}
     videos = find_embedded_videos(html, final_url or url)
+    if not videos and fetch is None:
+        videos = _videos_with_saved_cookies(url)
+    if not videos and fetch is None and getcourse_gate_request(html, url):
+        revealed = open_getcourse_recording(url)
+        if revealed:
+            videos = find_embedded_videos(revealed, final_url or url)
     if not videos:
         return {"mode": "direct", "videos": [], "scanned": True}
     return {"mode": "embeds", "videos": videos, "scanned": True}

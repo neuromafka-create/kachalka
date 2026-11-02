@@ -3,6 +3,7 @@
 # локального сервера внутри теста inspect.
 from __future__ import annotations
 
+import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -197,6 +198,57 @@ class FindEmbeddedTests(unittest.TestCase):
         self.assertFalse(pv.is_video_url("https://kinescope.io/"))
         self.assertFalse(pv.is_video_url("https://player.kinescope.io/v2/player.js"))
 
+    def test_getcourse_gate_uses_email_and_phone_from_the_link(self) -> None:
+        html = """
+        <script>
+        window.csrfToken = "token";
+        window.requestTime = 100;
+        window.requestSimpleSign = "sign";
+        </script>
+        <form action="https://school.example/pl/lite/block-public/process?id=7" method="post">
+            <input type="hidden" name="formParams[willCreatePaidDeal]" value="0">
+            <input name="formParams[email]" value="">
+            <input
+                name="formParams[phone]"
+                value="">
+        </form>
+        """
+        page = "https://school.example/record?email=user@example.com&phone=+70000000000"
+        gate = pv.getcourse_gate_request(html, page)
+        self.assertIsNotNone(gate)
+        assert gate is not None
+        action, fields = gate
+        self.assertEqual(
+            action,
+            "https://school.example/pl/lite/block-public/process?id=7",
+        )
+        self.assertEqual(fields["formParams[email]"], "user@example.com")
+        self.assertEqual(fields["formParams[phone]"], "+70000000000")
+        self.assertEqual(fields["requestSimpleSign"], "sign")
+        self.assertEqual(fields["formParams[willCreatePaidDeal]"], "0")
+
+    def test_getcourse_gate_does_not_invent_contact_data(self) -> None:
+        html = """
+        <script>
+        window.csrfToken = "token";
+        window.requestTime = 100;
+        window.requestSimpleSign = "sign";
+        </script>
+        <form action="https://school.example/pl/lite/block-public/process?id=7">
+            <input name="formParams[email]" value="">
+            <input name="formParams[phone]" value="">
+        </form>
+        """
+        self.assertIsNone(
+            pv.getcourse_gate_request(html, "https://school.example/record")
+        )
+        self.assertIsNone(
+            pv.getcourse_gate_request(
+                html,
+                "https://other.example/record?email=user@example.com&phone=+70000000000",
+            )
+        )
+
     def test_getcourse_host_without_player_is_not_a_video(self) -> None:
         html = '<a href="https://vh-api-1-de.gceuproxy.com/health">cdn</a>'
         self.assertEqual(_urls(html), [])
@@ -252,6 +304,76 @@ class DirectUrlTests(unittest.TestCase):
             "https://news.example/poster.jpg",
         ):
             self.assertFalse(pv.is_video_url(url), url)
+
+    def test_hackertube_watch_is_the_youtube_video(self) -> None:
+        page = "https://hackertube.org/watch/NOAgplgTxfc"
+        youtube = "https://www.youtube.com/watch?v=NOAgplgTxfc"
+        self.assertTrue(pv.is_video_url(page))
+        self.assertEqual(pv.canonical_key(page), "yt:NOAgplgTxfc")
+        self.assertEqual(pv.download_url(page), youtube)
+        self.assertEqual(pv.service_name(page), "YouTube")
+        self.assertEqual(
+            pv.download_url("https://www.hackertube.org/watch/NOAgplgTxfc/"),
+            youtube,
+        )
+        self.assertEqual(
+            pv.download_url("https://hackertube.org/#/watch/NOAgplgTxfc"),
+            youtube,
+        )
+        self.assertEqual(pv.download_url("https://hackertube.org/watch/Ab-d_fghijk"), "https://www.youtube.com/watch?v=Ab-d_fghijk")
+
+    def test_hackertube_other_pages_are_not_videos(self) -> None:
+        for url in (
+            "https://hackertube.org/",
+            "https://hackertube.org/search/depression",
+            "https://hackertube.org/playlists",
+            "https://hackertube.org/p/lectures",
+            "https://hackertube.org/watch/short",
+            "https://hackertube.org/watch/NOAgplgTxfc/extra",
+            "https://evilhackertube.org/watch/NOAgplgTxfc",
+            "https://hackertube.org.evil/watch/NOAgplgTxfc",
+        ):
+            self.assertFalse(pv.is_video_url(url), url)
+            self.assertNotIn("youtube.com", pv.download_url(url), url)
+
+    def test_hackertube_shell_template_is_not_a_player(self) -> None:
+        html = (
+            '<div id="player"><button class="poster" id="poster"></button></div>'
+            "<script>const playerHTML = (d) => "
+            '`<iframe src="https://www.youtube-nocookie.com/embed/${d.vid}?rel=0"></iframe>`'
+            "</script>"
+        )
+
+        def fake(_url: str) -> tuple[str, str, str]:
+            return "https://hackertube.org/", html, "text/html"
+
+        found = pv.inspect_page("https://hackertube.org/", fetch=fake)
+        self.assertEqual(found["mode"], "direct")
+        self.assertEqual(found["videos"], [])
+        self.assertTrue(found["scanned"])
+
+    def test_inspect_does_not_fetch_hackertube_watch(self) -> None:
+        def boom(_url: str) -> tuple[str, str, str]:
+            raise AssertionError("страницу лекции качать не нужно")
+
+        found = pv.inspect_page("https://hackertube.org/watch/NOAgplgTxfc", fetch=boom)
+        self.assertEqual(found["mode"], "direct")
+        self.assertFalse(found["scanned"])
+
+    def test_normalize_rewrites_hackertube_before_download(self) -> None:
+        import app
+
+        youtube = "https://www.youtube.com/watch?v=NOAgplgTxfc"
+        self.assertEqual(app._normalize_url("https://hackertube.org/watch/NOAgplgTxfc"), youtube)
+        self.assertEqual(
+            app._normalize_url("глянь https://www.hackertube.org/#/watch/NOAgplgTxfc"),
+            youtube,
+        )
+        self.assertEqual(app._normalize_url("https://hackertube.org/"), "https://hackertube.org/")
+        self.assertEqual(
+            app._normalize_url("https://hackertube.org/search/depression"),
+            "https://hackertube.org/search/depression",
+        )
 
     def test_inspect_skips_fetch_for_direct_link(self) -> None:
         def boom(_url: str) -> tuple[str, str, str]:
@@ -379,6 +501,80 @@ class LiveFetchTests(unittest.TestCase):
         self.assertEqual(found["mode"], "embeds")
         self.assertEqual(found["videos"][0]["url"], YT)
         self.assertEqual(found["videos"][0]["title"], "Локальный урок")
+
+    def test_getcourse_form_reveals_kinescope(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                port = self.server.server_address[1]
+                if self.path.startswith("/record"):
+                    body = (
+                        "<script>"
+                        'window.csrfToken = "token";'
+                        "window.requestTime = 100;"
+                        'window.requestSimpleSign = "sign";'
+                        "</script>"
+                        f'<form action="http://127.0.0.1:{port}/pl/lite/block-public/process?id=7" method="post">'
+                        '<input name="formParams[email]" value="">'
+                        '<input name="formParams[phone]" value="">'
+                        "</form>"
+                    ).encode("utf-8")
+                elif self.path.startswith("/pl/system/redirect-auth"):
+                    body = b'<iframe src="https://kinescope.io/embed/abcdefghij1234"></iframe>'
+                else:
+                    body = b"no"
+                self._send(body)
+
+            def _send(self, body: bytes) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+
+        def do_post_fixed(handler: BaseHTTPRequestHandler) -> None:
+            length = int(handler.headers.get("Content-Length") or "0")
+            raw = handler.rfile.read(length).decode("utf-8")
+            handler.server.posted = raw  # type: ignore[attr-defined]
+            payload = json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "formProcessed": True,
+                        "redirectUrl": f"http://127.0.0.1:{port}/pl/system/redirect-auth",
+                    },
+                }
+            ).encode("utf-8")
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        Handler.do_POST = do_post_fixed  # type: ignore[method-assign]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            found = pv.inspect_page(
+                f"http://127.0.0.1:{port}/record?email=user@example.com&phone=+70000000000"
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(found["mode"], "embeds")
+        self.assertEqual(len(found["videos"]), 1)
+        self.assertEqual(
+            found["videos"][0]["url"],
+            "https://kinescope.io/embed/abcdefghij1234",
+        )
+        posted = getattr(server, "posted", "")
+        self.assertIn("user%40example.com", posted)
+        self.assertIn("%2B70000000000", posted)
 
 
 if __name__ == "__main__":

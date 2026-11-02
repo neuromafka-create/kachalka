@@ -67,9 +67,25 @@
     }
 
     h1 {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: center;
+      gap: 8px 10px;
       font-size: 1.65rem;
       font-weight: 700;
       letter-spacing: -0.02em;
+    }
+
+    .app-version {
+      font-size: 0.85rem;
+      font-weight: 600;
+      letter-spacing: 0;
+      color: var(--muted);
+    }
+
+    .app-version.has-update {
+      color: var(--warn);
     }
 
     .subtitle {
@@ -184,6 +200,24 @@
       opacity: 0.55;
       cursor: not-allowed;
       transform: none;
+    }
+
+    button.logo {
+      padding: 0;
+      border-radius: 14px;
+      font-weight: 400;
+      background: rgba(61, 214, 140, 0.12);
+      border: 1px solid rgba(61, 214, 140, 0.35);
+    }
+
+    button.logo:hover:not(:disabled) {
+      background: rgba(61, 214, 140, 0.2);
+      border-color: rgba(61, 214, 140, 0.7);
+    }
+
+    button.logo:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
     }
 
     .btn-primary {
@@ -453,6 +487,86 @@
       word-break: break-all;
     }
 
+    .about-layer {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background: rgba(8, 10, 16, 0.72);
+    }
+
+    .about-card {
+      position: relative;
+      width: 100%;
+      max-width: 380px;
+      padding: 22px 22px 18px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+
+    .about-card h2 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .about-now {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .about-lead {
+      margin: 12px 0 14px;
+      color: var(--text);
+      font-size: 0.9rem;
+      line-height: 1.45;
+    }
+
+    .about-status {
+      min-height: 1.35em;
+      margin-bottom: 14px;
+      font-size: 0.88rem;
+      line-height: 1.4;
+      color: var(--muted);
+    }
+
+    .about-status.ok { color: var(--ok); }
+    .about-status.warn { color: var(--warn); }
+    .about-status.err { color: var(--err); }
+
+    .about-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .about-actions button { width: 100%; }
+
+    .about-close {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      width: 32px;
+      height: 32px;
+      padding: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 1.25rem;
+      line-height: 1;
+    }
+
+    .about-close:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text);
+    }
+
     .hidden { display: none !important; }
 
     footer {
@@ -468,8 +582,8 @@
 <body>
   <div class="wrap">
     <header>
-      <div class="logo" aria-hidden="true">
-        <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <button type="button" class="logo" id="btn-about" aria-label="О программе" title="О программе">
+        <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
           <!-- контур облака -->
           <path
             d="M18 36c-4.4 0-8-3.1-8-7s3.6-7 8-7c.6-5.5 5.3-9.8 11-9.8 5.2 0 9.5 3.5 10.7 8.2.7-.2 1.5-.3 2.3-.3 4.4 0 8 3.1 8 7s-3.6 7-8 7H18z"
@@ -481,8 +595,8 @@
           <path d="M32 28v14" stroke="#2dc878" stroke-width="5" stroke-linecap="round"/>
           <path d="M20 40 L32 54 L44 40 Z" fill="#2dc878"/>
         </svg>
-      </div>
-      <h1>Качалка</h1>
+      </button>
+      <h1>Качалка<span class="app-version hidden" id="app-version"></span></h1>
       <p class="subtitle">Ссылка на ролик или на страницу, где он встроен</p>
     </header>
 
@@ -627,6 +741,20 @@
     </section>
 
     <footer id="footer">Качалка · локально на этом ПК</footer>
+  </div>
+
+  <div id="about-layer" class="about-layer hidden" role="dialog" aria-modal="true" aria-labelledby="about-title">
+    <div class="about-card">
+      <button type="button" class="about-close" id="about-close" aria-label="Закрыть">×</button>
+      <h2 id="about-title">Качалка</h2>
+      <p class="about-now" id="about-now"></p>
+      <p class="about-lead">Скачивает видео и звук по ссылке. Окно работает на этом компьютере.</p>
+      <p class="about-status" id="about-status"></p>
+      <div class="about-actions">
+        <button type="button" class="btn-secondary" id="about-check">Проверить обновления</button>
+        <button type="button" class="btn-primary" id="about-download" disabled>Скачать новую версию</button>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -1330,6 +1458,123 @@
     $("btn-again").addEventListener("click", resetAndForm);
     $("btn-retry").addEventListener("click", resetAndForm);
 
+    const aboutLayer = $("about-layer");
+    const aboutStatus = $("about-status");
+    const aboutCheck = $("about-check");
+    const aboutDownload = $("about-download");
+    let updateInfo = null;
+    let updateBusy = false;
+    let updateQueued = false;
+    let installedVersion = "";
+
+    function showInstalledVersion(version, hasUpdate) {
+      const el = $("app-version");
+      installedVersion = version || installedVersion;
+      if (!installedVersion) {
+        el.textContent = "";
+        el.classList.add("hidden");
+        return;
+      }
+      el.classList.remove("hidden");
+      el.textContent = hasUpdate ? installedVersion + " · есть новее" : installedVersion;
+      el.classList.toggle("has-update", Boolean(hasUpdate));
+      $("about-now").textContent = "Сейчас стоит " + installedVersion;
+    }
+
+    function applyUpdateInfo(info) {
+      updateInfo = info || null;
+      const current = (info && info.current) || installedVersion;
+      showInstalledVersion(current, Boolean(info && info.update));
+      aboutStatus.textContent = (info && info.message) || "";
+      aboutStatus.classList.toggle("ok", Boolean(info && info.ok && !info.update));
+      aboutStatus.classList.toggle("warn", Boolean(info && info.update));
+      aboutStatus.classList.toggle("err", Boolean(info && info.ok === false));
+      const url = (info && (info.download_url || (info.update && info.page_url))) || "";
+      aboutDownload.disabled = !url;
+    }
+
+    function openAbout() {
+      aboutLayer.classList.remove("hidden");
+      if (updateInfo) applyUpdateInfo(updateInfo);
+      else if (updateBusy) {
+        aboutStatus.textContent = "Проверяю…";
+        aboutStatus.className = "about-status";
+      }
+      aboutCheck.focus();
+    }
+
+    function closeAbout() {
+      aboutLayer.classList.add("hidden");
+      $("btn-about").focus();
+    }
+
+    async function refreshUpdates(fromUser) {
+      if (updateBusy) {
+        if (fromUser) updateQueued = true;
+        return;
+      }
+      updateBusy = true;
+      if (fromUser) {
+        aboutStatus.textContent = "Проверяю…";
+        aboutStatus.className = "about-status";
+        aboutCheck.disabled = true;
+        aboutDownload.disabled = true;
+      }
+      try {
+        const res = await fetch("/api/updates");
+        const info = await res.json();
+        if (!fromUser && !info.ok) return;
+        applyUpdateInfo(info);
+      } catch (_) {
+        if (fromUser) {
+          applyUpdateInfo({
+            ok: false,
+            current: installedVersion,
+            update: false,
+            message: "Не удалось проверить обновления. Проверь интернет и попробуй ещё раз.",
+          });
+        }
+      } finally {
+        updateBusy = false;
+        aboutCheck.disabled = false;
+        if (updateQueued) {
+          updateQueued = false;
+          refreshUpdates(true);
+        }
+      }
+    }
+
+    $("btn-about").addEventListener("click", openAbout);
+    $("about-close").addEventListener("click", closeAbout);
+    aboutLayer.addEventListener("click", (event) => {
+      if (event.target === aboutLayer) closeAbout();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !aboutLayer.classList.contains("hidden")) closeAbout();
+    });
+    aboutCheck.addEventListener("click", () => {
+      refreshUpdates(true);
+    });
+    aboutDownload.addEventListener("click", async () => {
+      const url = updateInfo && (updateInfo.download_url || updateInfo.page_url);
+      if (!url) return;
+      try {
+        const res = await fetch("/api/open-release", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          aboutStatus.textContent = data.error || "Не удалось открыть ссылку.";
+          aboutStatus.className = "about-status err";
+        }
+      } catch (_) {
+        aboutStatus.textContent = "Не удалось открыть ссылку.";
+        aboutStatus.className = "about-status err";
+      }
+    });
+
     // При открытии
     (async () => {
       try {
@@ -1338,11 +1583,13 @@
         defaultFolder = cfg.default_folder || "";
         cookiesFileName = cfg.cookies_file_name || "";
         savedBrowsers = Array.isArray(cfg.saved_browsers) ? cfg.saved_browsers : [];
+        showInstalledVersion(cfg.version || "", false);
       } catch (_) {
         defaultFolder = "";
         cookiesFileName = "";
         savedBrowsers = [];
       }
+      refreshUpdates(false);
 
       let saved = "";
       let savedMode = "video";
